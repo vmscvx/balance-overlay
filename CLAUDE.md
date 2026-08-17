@@ -1,0 +1,51 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+```bash
+cargo build --release        # produces target/release/balance-overlay.exe
+cargo clippy --all-targets
+cargo test                   # pure-logic tests only: money formatting, color conversion
+cargo test balance_formatting
+```
+
+Tests cover only the two things that can be checked without a window. Everything else is a manual, visual check: the binary has no console (`#![windows_subsystem = "windows"]`), so `eprintln!` output is invisible in normal use — never rely on it for diagnostics. On first run it writes `balance_overlay.toml` next to the executable (defaults, empty tokens) and hides itself, because with no tokens there are no lines to draw. To see anything, fill in at least one of `deepseek_token` / `proxyapi_token` / `openrouter_token` in that file and restart.
+
+Windows-only: the `windows` crate, GDI, and `RegisterHotKey` mean this does not build or run anywhere else.
+
+## Architecture
+
+A layered always-on-top overlay window that polls API-credit balances and paints them as text, one line per provider. Two threads, one shared state object.
+
+**Threads.** The main thread creates the window and runs the classic `GetMessageW` pump. A second `std::thread` owns a single-threaded tokio runtime running `balance_fetcher_loop`, which polls every configured API in turn, writes the formatted strings into shared state, and posts `WM_UPDATE_DISPLAY` (a `WM_USER + 1` custom message) to wake the UI thread. All cross-thread signalling goes through `PostMessageW`; the fetcher thread never draws and never calls a window-manipulating API, because those send synchronous messages back to the UI thread.
+
+**Shared state.** `AppState` in `main.rs` holds everything behind `Mutex`es and lives in a `OnceLock<Arc<AppState>>` global. The global exists because `wnd_proc` is an `extern "system"` callback with no user-data pointer; `get_state()` is how the window procedure reaches the app. Lock order in practice is *lines → config → font → window dimensions*; keep it that way, and drop guards before calling any Win32 function that can re-enter the window procedure.
+
+**Providers are a table, not fields.** `Provider` (`balance.rs`) carries its own label and URL, and `sources(&cfg)` in `main.rs` produces the active `(Provider, token)` list by filtering out blank tokens. Adding a provider means: a config field, an enum variant with its label/URL, one row in `sources()`, and a response-parsing arm in `fetch`. Nothing else in the app is per-provider — line count, window size, and painting all derive from the length of that list.
+
+**Display state is string-shaped.** `state.lines` holds pre-formatted display strings, not numbers — including error text (`"OPENROUTER: Invalid token"`) and the initial `"LOADING..."`. The vector has exactly one entry per configured provider, so a failing API keeps its slot rather than collapsing the layout. Errors are therefore visible in the overlay itself, which is the only diagnostic channel this app has.
+
+**Layout.** `relayout` measures the widest line with `GetTextExtentPoint32W` against the real font, then positions and sizes the window in one `SetWindowPos`. It runs on the UI thread only — from `WM_UPDATE_DISPLAY`, from `WM_DPICHANGED`, and once at startup — and returns early when the resulting rect is unchanged, which is the common case on a poll. `render::paint` re-derives per-line height as `height / lines.len()`, so that calculation must stay in step with `line_height`.
+
+**DPI.** The process declares `PER_MONITOR_AWARE_V2` before any window exists, which opts out of DWM bitmap-stretching: text stays sharp, but nothing is scaled for you. Every config dimension (`font_size`, `pos_x`, `pos_y`, `PAD_X`, `line_height`) is a logical value at 96 DPI and must go through `scale()` before it reaches Win32 — `window_rect` and everything `render.rs` touches are already physical pixels. `WM_DPICHANGED` rebuilds the font at the new scale and re-lays out; it deliberately ignores the suggested rect Windows passes in `lparam`, since the window's size comes from its text, not from the old size. `outline_width` is intentionally *not* scaled — it is a hairline by intent, and the user can raise it in config.
+
+**Painting.** `render::paint` double-buffers into a memory DC and `BitBlt`s once, to avoid flicker on the layered window. Outline text is brute force: `draw_text_outline` redraws the string at every offset in a `(2w+1)²` box before the fill pass, so `outline_width` in config is quadratic in cost.
+
+**Window flags** in `create_window` are load-bearing as a set: `WS_EX_LAYERED` for `SetLayeredWindowAttributes` opacity, `WS_EX_TRANSPARENT` + `WS_EX_NOACTIVATE` so clicks pass through and focus is never stolen, `WS_EX_TOOLWINDOW` to stay out of Alt+Tab, `WS_EX_TOPMOST` to stay above everything. Dropping any one of them changes the "invisible passive overlay" behaviour.
+
+**Hotkeys** are registered on the window, not globally scoped to the process: Shift+F11 toggles visibility, Ctrl+Shift+F11 exits. `RegisterHotKey` matches modifiers exactly, so the two do not collide.
+
+**Config** (`config.rs`) is a flat TOML struct where every field has a `#[serde(default)]`, so adding a field is backward-compatible with existing user files. It is read once at startup and cloned into `AppState`; there is no reload path, so changing config requires a restart. `load_or_create` writes the file only when it does not exist — an unparseable config falls back to in-memory defaults and is deliberately left on disk, because overwriting it would destroy the user's API tokens.
+
+**API layer** (`balance.rs`) returns `Result<_, String>` throughout — no error type, because every error's only destiny is being rendered as a line of text. `fetch` shares the request, auth-failure, and body-read path, then branches per provider only for parsing, since the response shapes have nothing in common: DeepSeek returns `balance_infos[0].total_balance` as a *string* that must be parsed, ProxyAPI returns a float but can answer 200 with an `"Invalid API Key"` body (hence the text sniff before deserializing), and OpenRouter reports `total_credits` and `total_usage` separately — the balance is their difference.
+
+## Gotchas
+
+- The `reqwest::Client` is built once outside the poll loop; rebuilding it per request re-does the whole TLS setup.
+- `refresh_interval_secs` is floored at `MIN_REFRESH_SECS` — a `0` in the config would otherwise mean an unthrottled request loop.
+- `format_balance` rounds once in integer cents; computing integer and fractional parts independently is what used to turn `12.999` into `12.100`.
+- `parse_hex_color` swaps R and B, because GDI `COLORREF` is `0x00BBGGRR`, not RGB. Grey/white/black are palindromic, so a regression here stays invisible until someone configures an actual color.
+- The font is owned by `state.font` and swapped by `replace_font`, which deletes the old handle. Both it and `render::paint` must stay on the UI thread — deleting a font selected into another thread's DC is a use-after-free.
+- `balance_overlay.toml` is resolved against the *working directory*, not the exe's folder, so a shortcut to the installed copy must set "Start in". The installed copy lives in `%APPDATA%\balance-overlay\` and holds API tokens in plaintext; the repo gitignores its local equivalent.

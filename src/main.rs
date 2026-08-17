@@ -1,0 +1,397 @@
+#![windows_subsystem = "windows"]
+
+mod balance;
+mod config;
+mod render;
+
+use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, OnceLock,
+};
+use std::thread;
+
+use windows::{
+    core::{w, PCWSTR},
+    Win32::Foundation::*,
+    Win32::Graphics::Gdi::*,
+    Win32::System::LibraryLoader::*,
+    Win32::UI::HiDpi::*,
+    Win32::UI::Input::KeyboardAndMouse::*,
+    Win32::UI::WindowsAndMessaging::*,
+};
+
+use balance::Provider;
+
+fn str_to_wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[derive(Debug)]
+pub struct AppState {
+    pub config: Mutex<config::Config>,
+    /// One display line per configured provider, in `sources()` order.
+    pub lines: Mutex<Vec<String>>,
+    pub visible: AtomicBool,
+    pub hwnd: Mutex<Option<HWND>>,
+    pub font: Mutex<Option<HFONT>>,
+    /// Physical pixels: (x, y, width, height).
+    pub window_rect: Mutex<(i32, i32, i32, i32)>,
+}
+
+const HOTKEY_TOGGLE: u32 = 1;
+const HOTKEY_EXIT: u32 = 2;
+const WM_UPDATE_DISPLAY: u32 = WM_USER + 1;
+
+/// Text inset inside the window: 8px left in render::paint, plus slack on the right.
+const PAD_X: i32 = 14;
+const MIN_REFRESH_SECS: u64 = 5;
+const BASE_DPI: i32 = 96;
+
+static APP_STATE: OnceLock<Arc<AppState>> = OnceLock::new();
+
+fn get_state() -> &'static Arc<AppState> {
+    APP_STATE.get().expect("APP_STATE not initialized")
+}
+
+fn sources(cfg: &config::Config) -> Vec<(Provider, String)> {
+    // Alphabetical by label; this order is the display order.
+    [
+        (Provider::DeepSeek, &cfg.deepseek_token),
+        (Provider::OpenRouter, &cfg.openrouter_token),
+        (Provider::ProxyApi, &cfg.proxyapi_token),
+    ]
+    .into_iter()
+    .filter(|(_, token)| !token.trim().is_empty())
+    .map(|(p, token)| (p, token.trim().to_string()))
+    .collect()
+}
+
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let state = get_state();
+
+    match msg {
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            render::paint(hdc, state);
+            let _ = EndPaint(hwnd, &ps);
+            return LRESULT(0);
+        }
+        WM_ERASEBKGND => {
+            return LRESULT(1);
+        }
+        WM_HOTKEY => {
+            let id = wparam.0 as u32;
+            if id == HOTKEY_TOGGLE {
+                let visible = state.visible.load(Ordering::SeqCst);
+                let _ = ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOW });
+                state.visible.store(!visible, Ordering::SeqCst);
+            } else if id == HOTKEY_EXIT {
+                let _ = DestroyWindow(hwnd);
+            }
+            return LRESULT(0);
+        }
+        WM_UPDATE_DISPLAY => {
+            // Layout lives here, on the UI thread: SetWindowPos from the
+            // fetcher thread blocks on a synchronous message to this one.
+            relayout(hwnd, state, GetDpiForWindow(hwnd));
+            let _ = InvalidateRect(hwnd, None, FALSE);
+            let _ = UpdateWindow(hwnd);
+            return LRESULT(0);
+        }
+        WM_DPICHANGED => {
+            // The suggested rect Windows passes in lparam is for windows that
+            // keep their size; ours is derived from the text, so ignore it and
+            // rebuild the font at the new scale instead.
+            let dpi = (wparam.0 & 0xFFFF) as u32;
+            let cfg = state.config.lock().unwrap().clone();
+            replace_font(state, &cfg, dpi);
+            relayout(hwnd, state, dpi);
+            let _ = InvalidateRect(hwnd, None, FALSE);
+            return LRESULT(0);
+        }
+        WM_DESTROY => {
+            let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE as i32);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_EXIT as i32);
+
+            let mut font_lock = state.font.lock().unwrap();
+            if let Some(font) = font_lock.take() {
+                let _ = DeleteObject(font);
+            }
+
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+fn create_window(cfg: &config::Config) -> HWND {
+    let hinstance = unsafe { GetModuleHandleW(None).expect("GetModuleHandleW failed") };
+
+    let class_name = w!("BalanceOverlayWnd");
+
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(wnd_proc),
+        hInstance: hinstance.into(),
+        lpszClassName: class_name,
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW).expect("LoadCursorW failed") },
+        hbrBackground: HBRUSH::default(),
+        ..Default::default()
+    };
+
+    unsafe { RegisterClassW(&wc) };
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_LAYERED
+                | WS_EX_TOPMOST
+                | WS_EX_TRANSPARENT
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE,
+            class_name,
+            w!("BalanceOverlay"),
+            WS_POPUP | WS_VISIBLE,
+            // Placeholder geometry; relayout() sets the real one once the
+            // window exists and its monitor's DPI can be queried.
+            cfg.pos_x,
+            cfg.pos_y,
+            300,
+            100,
+            None,
+            None,
+            hinstance,
+            None,
+        )
+    };
+
+    if hwnd.0 == 0 {
+        panic!("CreateWindowExW failed");
+    }
+
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), cfg.opacity, LWA_ALPHA);
+    }
+
+    hwnd
+}
+
+/// Config values are logical pixels at 96 DPI; everything Win32 sees is physical.
+fn scale(value: i32, dpi: u32) -> i32 {
+    value * dpi as i32 / BASE_DPI
+}
+
+fn line_height(cfg: &config::Config, dpi: u32) -> i32 {
+    scale((cfg.font_size * 3 / 2).max(24), dpi)
+}
+
+fn create_font(cfg: &config::Config, dpi: u32) -> HFONT {
+    let font_name_w = str_to_wide(&cfg.font_name);
+    unsafe {
+        CreateFontW(
+            scale(cfg.font_size, dpi),
+            0,
+            0,
+            0,
+            if cfg.font_bold { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 },
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET.0 as u32,
+            OUT_DEFAULT_PRECIS.0 as u32,
+            CLIP_DEFAULT_PRECIS.0 as u32,
+            CLEARTYPE_QUALITY.0 as u32,
+            FF_DONTCARE.0 as u32,
+            PCWSTR(font_name_w.as_ptr()),
+        )
+    }
+}
+
+/// UI thread only — the old font may be selected into a DC on this thread.
+fn replace_font(state: &AppState, cfg: &config::Config, dpi: u32) {
+    let font = create_font(cfg, dpi);
+    if let Some(old) = state.font.lock().unwrap().replace(font) {
+        unsafe {
+            let _ = DeleteObject(old);
+        }
+    }
+}
+
+/// Positions the window per config and fits it to the widest line. UI thread only.
+fn relayout(hwnd: HWND, state: &AppState, dpi: u32) {
+    let lines = state.lines.lock().unwrap().clone();
+    let (lh, outline, x, y) = {
+        let cfg = state.config.lock().unwrap();
+        (
+            line_height(&cfg, dpi),
+            cfg.outline_width as i32,
+            scale(cfg.pos_x, dpi),
+            scale(cfg.pos_y, dpi),
+        )
+    };
+    let font = state.font.lock().unwrap().unwrap_or_default();
+
+    let mut text_width = 0;
+    unsafe {
+        let hdc = GetDC(hwnd);
+        let old_font = SelectObject(hdc, font);
+        for line in &lines {
+            let wide: Vec<u16> = line.encode_utf16().collect();
+            let mut size = SIZE::default();
+            if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
+                text_width = text_width.max(size.cx);
+            }
+        }
+        SelectObject(hdc, old_font);
+        ReleaseDC(hwnd, hdc);
+    }
+
+    let new_rect = (
+        x,
+        y,
+        (text_width + scale(PAD_X, dpi) + outline * 2).max(1),
+        lines.len() as i32 * lh,
+    );
+
+    let mut rect = state.window_rect.lock().unwrap();
+    if *rect == new_rect {
+        return;
+    }
+    *rect = new_rect;
+    drop(rect);
+
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            new_rect.0,
+            new_rect.1,
+            new_rect.2,
+            new_rect.3,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+async fn balance_fetcher_loop(state: Arc<AppState>) {
+    let client = match balance::client() {
+        Ok(c) => c,
+        Err(e) => {
+            *state.lines.lock().unwrap() = vec![e];
+            notify(&state);
+            return;
+        }
+    };
+
+    loop {
+        let (refresh_interval, srcs) = {
+            let cfg = state.config.lock().unwrap();
+            (cfg.refresh_interval_secs.max(MIN_REFRESH_SECS), sources(&cfg))
+        };
+
+        let mut lines = Vec::with_capacity(srcs.len());
+        for (provider, token) in &srcs {
+            lines.push(balance::fetch_line(&client, *provider, token).await);
+        }
+        *state.lines.lock().unwrap() = lines;
+
+        notify(&state);
+
+        tokio::time::sleep(std::time::Duration::from_secs(refresh_interval)).await;
+    }
+}
+
+fn notify(state: &AppState) {
+    if let Some(hwnd) = *state.hwnd.lock().unwrap() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_UPDATE_DISPLAY, None, None);
+        }
+    }
+}
+
+fn main() {
+    // Before any window exists: opt out of DWM bitmap-stretching, so the text
+    // stays sharp and GetDpiForWindow reports the monitor's real DPI.
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
+    let cfg = config::Config::load_or_create("balance_overlay.toml");
+
+    let srcs = sources(&cfg);
+    let loading: Vec<String> = srcs
+        .iter()
+        .map(|(p, _)| format!("{}: LOADING...", p.label()))
+        .collect();
+
+    let state = Arc::new(AppState {
+        config: Mutex::new(cfg.clone()),
+        lines: Mutex::new(loading),
+        visible: AtomicBool::new(true),
+        hwnd: Mutex::new(None),
+        font: Mutex::new(None),
+        window_rect: Mutex::new((0, 0, 0, 0)),
+    });
+
+    APP_STATE.set(state.clone()).expect("APP_STATE already set");
+
+    let hwnd = create_window(&cfg);
+    *state.hwnd.lock().unwrap() = Some(hwnd);
+
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    replace_font(&state, &cfg, dpi);
+    relayout(hwnd, &state, dpi);
+
+    if srcs.is_empty() {
+        state.visible.store(false, Ordering::SeqCst);
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    unsafe {
+        if RegisterHotKey(hwnd, HOTKEY_TOGGLE as i32, MOD_SHIFT, VK_F11.0 as u32).is_err() {
+            eprintln!("Warning: Failed to register Shift+F11 (maybe already in use?)");
+        }
+        if RegisterHotKey(
+            hwnd,
+            HOTKEY_EXIT as i32,
+            MOD_CONTROL | MOD_SHIFT,
+            VK_F11.0 as u32,
+        )
+        .is_err()
+        {
+            eprintln!("Warning: Failed to register Ctrl+Shift+F11 (maybe already in use?)");
+        }
+    }
+
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, FALSE);
+        let _ = UpdateWindow(hwnd);
+    }
+
+    thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(balance_fetcher_loop(state));
+    });
+
+    let mut msg = MSG::default();
+    unsafe {
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
