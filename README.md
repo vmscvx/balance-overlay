@@ -2,14 +2,25 @@
 
 A small always-on-top Windows overlay that keeps your API credit balances and your machine's load on screen, out of the way of everything else.
 
-It polls DeepSeek, OpenRouter and ProxyAPI for their remaining credit, and samples CPU and memory load once a second. Clicks pass straight through it, it never takes focus, and it stays out of Alt+Tab — you can leave it running over a full-screen editor and forget it is there.
+It polls DeepSeek, OpenRouter and ProxyAPI for their remaining credit, and samples CPU, memory and network once a second. Clicks pass straight through it, it never takes focus, and it stays out of Alt+Tab — you can leave it running over a full-screen editor and forget it is there.
 
 It shows one of two things at a time, and a hotkey swaps between them:
 
 - **System** — CPU, RAM and network as charts of the last minute. This is what it starts with.
 - **Balances** — one line per provider with its remaining credit.
 
-Sampling continues in both modes, so switching back to the charts shows the minute that actually passed rather than an empty graph.
+```
+ system mode                        balances mode
+
+ CPU  ▁▂▃▅▇▅▃▂▁▁▂▄▂▁▁    51%        DEEPSEEK: $ 4.62
+ RAM  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇    82%        OPENROUTER: $ 11.30
+ NET↓ ▁▁▁▁▁▁▁▂▅▇█▇▅▃▁  11.7 MB/s    PROXYAPI: 1 240.00 ₽
+ NET↑ ▁▁▁▁▁▁▁▁▂▂▃▂▂▁▁ 847.2 KB/s
+```
+
+Layout only — the charts are filled areas drawn with GDI, not text.
+
+Sampling continues in both modes, so switching back to the charts shows the minute that actually passed rather than an empty graph. The window resizes itself to whichever mode is up: four rows of chart, or one line per configured provider.
 
 ## Building
 
@@ -77,6 +88,8 @@ Sizes are logical values at 96 DPI: the overlay is per-monitor DPI aware and sca
 Tokens are stored in this file as plain text. It is listed in `.gitignore`, and it is worth keeping it that way.
 
 ## Notes
+
+Each chart row is a label, the chart itself, and the current value with its unit. The chart shows shape over the last minute; the number beside it is the one to read for magnitude.
 
 The window is sized to its own contents, so it shrinks and grows as the mode changes and as lines come and go.
 
