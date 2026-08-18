@@ -17,7 +17,7 @@ Windows-only: the `windows` crate, GDI, and `RegisterHotKey` mean this does not 
 
 ## Architecture
 
-A layered always-on-top overlay window that polls API-credit balances and paints them as text, one line per provider, plus a line of local CPU/RAM load. Two threads, one shared state object.
+A layered always-on-top overlay window that polls API-credit balances and paints them as text, one line per provider, plus a CPU row and a RAM row showing local load as bars. Two threads, one shared state object.
 
 **Threads.** The main thread creates the window and runs the classic `GetMessageW` pump. A second `std::thread` owns a single-threaded tokio runtime running `balance_fetcher_loop`, which polls every configured API in turn, writes the formatted strings into shared state, and posts `WM_UPDATE_DISPLAY` (a `WM_USER + 1` custom message) to wake the UI thread. All cross-thread signalling goes through `PostMessageW`; the fetcher thread never draws and never calls a window-manipulating API, because those send synchronous messages back to the UI thread.
 
@@ -25,9 +25,9 @@ A layered always-on-top overlay window that polls API-credit balances and paints
 
 **Providers are a table, not fields.** `Provider` (`balance.rs`) carries its own label and URL, and `sources(&cfg)` in `main.rs` produces the active `(Provider, token)` list by filtering out blank tokens. Adding a provider means: a config field, an enum variant with its label/URL, one row in `sources()`, and a response-parsing arm in `fetch`. Nothing else in the app is per-provider — line count, window size, and painting all derive from the length of that list.
 
-**Display state is string-shaped.** `state.lines` holds pre-formatted display strings, not numbers — including error text (`"OPENROUTER: Invalid token"`) and the initial `"LOADING..."`. Errors are therefore visible in the overlay itself, which is the only diagnostic channel this app has. The RAM bar is text too (`█`/`░` glyphs), which is why it inherits font, color, outline and DPI scaling for free and needs nothing from `render.rs`.
+**Display state is string-shaped.** `state.lines` holds pre-formatted display strings, not numbers — including error text (`"OPENROUTER: Invalid token"`) and the initial `"LOADING..."`. Errors are therefore visible in the overlay itself, which is the only diagnostic channel this app has. The load bars are text too (`█`/`░` glyphs), which is why they inherit font, color, outline and DPI scaling for free and need nothing from `render.rs`.
 
-**`lines` has a fixed slot layout and two writers.** Slots `0..n` are the providers in `sources()` order; the last slot is the system line when `show_system` is on. The vector is allocated once at startup and *never replaced* — each writer assigns into its own slots by index, because the two run at different rates and on different threads. Sizing follows from `lines.len()`, so a failing API keeps its slot rather than collapsing the layout.
+**`lines` has a fixed slot layout and two writers.** Slots `0..n` are the providers in `sources()` order; the last `system::LINE_COUNT` slots are the system block when `show_system` is on. The vector is allocated once at startup and *never replaced* — each writer assigns into its own slots by index, because the two run at different rates and on different threads. Sizing follows from `lines.len()`, so a failing API keeps its slot rather than collapsing the layout.
 
 **System metrics run on the UI thread.** `system.rs` is two Win32 calls: `GlobalMemoryStatusEx` (whose `dwMemoryLoad` is already a percentage) and `GetSystemTimes`. CPU load only exists as a *difference* between two samples, so `CpuSampler` holds the previous one and the first tick renders `--`. Both calls take microseconds and never block, which is why a `WM_TIMER` at `SYSTEM_TICK_MS` does the sampling directly in `wnd_proc` — no thread, no async, no new dependency. A per-second cadence is the point: the same number sampled by the 60-second balance poll would be meaningless.
 
@@ -47,8 +47,8 @@ A layered always-on-top overlay window that polls API-credit balances and paints
 
 ## Gotchas
 
-- The `WM_TIMER` handler writes `lines.last_mut()`, which is only the system slot because the timer is started **only** when `show_system` is on. Starting it unconditionally would silently overwrite a provider's line.
-- `system::line` pads percentages to a fixed width, so the window does not twitch a character wider and back every second as the numbers change.
+- The `WM_TIMER` handler overwrites the last `system::LINE_COUNT` slots, which are the system block only because the timer is started **only** when `show_system` is on. Starting it unconditionally, or letting `system::lines` return a different count than startup reserved, would silently overwrite a provider's line.
+- `system::row` pads percentages to a fixed width and the bar has a fixed cell count, so the window does not twitch a character wider and back every second as the numbers change.
 - The `reqwest::Client` is built once outside the poll loop; rebuilding it per request re-does the whole TLS setup.
 - `refresh_interval_secs` is floored at `MIN_REFRESH_SECS` — a `0` in the config would otherwise mean an unthrottled request loop.
 - `format_balance` rounds once in integer cents; computing integer and fractional parts independently is what used to turn `12.999` into `12.100`.

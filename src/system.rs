@@ -74,13 +74,16 @@ fn percent_text(percent: Option<u32>) -> String {
     }
 }
 
-pub fn line(cpu: Option<u32>, ram: Option<u32>) -> String {
-    format!(
-        "CPU {}  RAM [{}] {}",
-        percent_text(cpu),
-        bar(ram),
-        percent_text(ram)
-    )
+/// Display slots the system block occupies. Startup reserves this many at the
+/// tail of `state.lines`, and the timer overwrites exactly those.
+pub const LINE_COUNT: usize = 2;
+
+pub fn lines(cpu: Option<u32>, ram: Option<u32>) -> [String; LINE_COUNT] {
+    [row("CPU", cpu), row("RAM", ram)]
+}
+
+fn row(label: &str, percent: Option<u32>) -> String {
+    format!("{} {} {}", label, bar(percent), percent_text(percent))
 }
 
 #[cfg(test)]
@@ -106,11 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn line_width_is_stable() {
-        assert_eq!(
-            line(Some(5), Some(9)).chars().count(),
-            line(Some(100), Some(100)).chars().count()
+    fn rows_are_equal_width_whatever_the_numbers() {
+        let widths: Vec<usize> = [Some(0), Some(5), Some(61), Some(100), None]
+            .into_iter()
+            .flat_map(|p| lines(p, p))
+            .map(|l| l.chars().count())
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "row width must not depend on the value: {:?}",
+            widths
         );
-        assert_eq!(line(None, None).chars().count(), line(Some(7), Some(7)).chars().count());
     }
 }

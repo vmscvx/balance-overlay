@@ -115,14 +115,15 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER => {
             if wparam.0 == TIMER_SYSTEM {
                 let cpu = state.cpu.lock().unwrap().sample();
-                let text = system::line(cpu, system::memory_load());
+                let texts = system::lines(cpu, system::memory_load());
                 let mut lines = state.lines.lock().unwrap();
-                // The system line is the last slot; the fetcher owns the ones
-                // before it and writes them by index for the same reason.
-                if let Some(slot) = lines.last_mut() {
-                    if *slot == text {
-                        return LRESULT(0);
-                    }
+                // The system block is the tail of the vector, in the order
+                // startup pushed it; the fetcher owns everything before it.
+                let start = lines.len().saturating_sub(system::LINE_COUNT);
+                if lines[start..] == texts[..] {
+                    return LRESULT(0);
+                }
+                for (slot, text) in lines[start..].iter_mut().zip(texts) {
                     *slot = text;
                 }
                 drop(lines);
@@ -368,7 +369,7 @@ fn main() {
         .map(|(p, _)| format!("{}: LOADING...", p.label()))
         .collect();
     if cfg.show_system {
-        lines.push(system::line(None, None));
+        lines.extend(system::lines(None, None));
     }
 
     let state = Arc::new(AppState {
