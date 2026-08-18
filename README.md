@@ -9,16 +9,9 @@ It shows one of two things at a time, and a hotkey swaps between them:
 - **System** — CPU, RAM and network as charts of the last minute. This is what it starts with.
 - **Balances** — one line per provider with its remaining credit.
 
-```
- system mode                        balances mode
+![System mode: CPU, RAM and network charts with their current values](docs/overlay.png)
 
- CPU  ▁▂▃▅▇▅▃▂▁▁▂▄▂▁▁    51%        DEEPSEEK: $ 4.62
- RAM  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇    82%        OPENROUTER: $ 11.30
- NET↓ ▁▁▁▁▁▁▁▂▅▇█▇▅▃▁  11.7 MB/s    PROXYAPI: 1 240.00 ₽
- NET↑ ▁▁▁▁▁▁▁▁▂▂▃▂▂▁▁ 847.2 KB/s
-```
-
-Layout only — the charts are filled areas drawn with GDI, not text.
+Above is system mode, shown at twice its size — the window itself is 268 by 108 pixels here. Balance mode is the same window with one text line per provider instead.
 
 Sampling continues in both modes, so switching back to the charts shows the minute that actually passed rather than an empty graph. The window resizes itself to whichever mode is up: four rows of chart, or one line per configured provider.
 
