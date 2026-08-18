@@ -15,7 +15,10 @@ pub enum Row {
     /// Load history, drawn as a filled area chart, newest sample on the right.
     Graph {
         label: &'static str,
-        percent: Option<u32>,
+        /// The right-hand column, already formatted with its unit. The chart
+        /// only knows 0..100, so this is where the real magnitude is told.
+        value: String,
+        /// Samples normalised to 0..100 by whoever knows the units.
         history: Vec<u32>,
         /// Samples the chart is scaled for, so it scrolls in at a constant
         /// speed instead of stretching while the history fills up.
@@ -30,6 +33,13 @@ impl Row {
             Row::Graph { label, .. } => Some(label),
         }
     }
+
+    fn value(&self) -> Option<&str> {
+        match self {
+            Row::Text(_) => None,
+            Row::Graph { value, .. } => Some(value),
+        }
+    }
 }
 
 /// Frame, grid and fill are three steps of the meter color, so one config key
@@ -37,14 +47,6 @@ impl Row {
 const FRAME_SHADE: u32 = 5;
 const GRID_SHADE: u32 = 3;
 const WINDOW_BG: u32 = 0x0020_2020;
-
-/// Percentages are padded to a fixed width so the column does not jitter.
-fn percent_text(percent: Option<u32>) -> String {
-    match percent {
-        Some(p) => format!("{:>3}%", p),
-        None => "  --".to_string(),
-    }
-}
 
 fn text_width(hdc: HDC, text: &str) -> i32 {
     let wide: Vec<u16> = text.encode_utf16().collect();
@@ -65,7 +67,7 @@ struct Metrics {
     gap: i32,
     label_width: i32,
     meter_width: i32,
-    percent_width: i32,
+    value_width: i32,
     grid_cell: i32,
 }
 
@@ -83,7 +85,15 @@ impl Metrics {
                 .max()
                 .unwrap_or(0),
             meter_width: scale(meter_width_logical, dpi),
-            percent_width: text_width(hdc, &percent_text(Some(100))),
+            // Value strings are padded to a fixed width by whoever formats
+            // them, so measuring the current ones does not make the window
+            // breathe as the numbers change.
+            value_width: rows
+                .iter()
+                .filter_map(|r| r.value())
+                .map(|v| text_width(hdc, v))
+                .max()
+                .unwrap_or(0),
             grid_cell: scale(GRID_CELL, dpi),
         }
     }
@@ -96,7 +106,7 @@ impl Metrics {
         match row {
             Row::Text(text) => self.pad_left + text_width(hdc, text),
             Row::Graph { .. } => {
-                self.meter_left() + self.meter_width + self.gap + self.percent_width
+                self.meter_left() + self.meter_width + self.gap + self.value_width
             }
         }
     }
@@ -228,7 +238,7 @@ unsafe fn draw(
             Row::Text(text) => {
                 draw_row_text(hdc, text, text_rect(m.pad_left), text_rgb, outline_rgb, cfg.outline_width);
             }
-            Row::Graph { label, percent, history, capacity } => {
+            Row::Graph { label, value, history, capacity } => {
                 draw_row_text(hdc, label, text_rect(m.pad_left), text_rgb, outline_rgb, cfg.outline_width);
 
                 // A meter reads better as a band than as a full-height block.
@@ -245,7 +255,7 @@ unsafe fn draw(
 
                 draw_row_text(
                     hdc,
-                    &percent_text(*percent),
+                    value,
                     text_rect(meter.right + m.gap),
                     text_rgb,
                     outline_rgb,

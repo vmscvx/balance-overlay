@@ -95,7 +95,7 @@ const WM_UPDATE_DISPLAY: u32 = WM_USER + 1;
 const TIMER_SYSTEM: usize = 1;
 /// CPU load is a rate, so it needs a cadence of its own: the balance poll runs
 /// a hundred times slower and would report a meaningless number.
-const SYSTEM_TICK_MS: u32 = 1000;
+pub const SYSTEM_TICK_MS: u32 = 1000;
 
 /// Text insets inside the window, logical pixels.
 pub const PAD_LEFT: i32 = 8;
@@ -172,8 +172,9 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TIMER => {
             if wparam.0 == TIMER_SYSTEM {
+                let interface = state.config.lock().unwrap().network_interface.clone();
                 let mut metrics = state.metrics.lock().unwrap();
-                metrics.sample();
+                metrics.sample(&interface);
                 let rows = metrics.rows();
                 drop(metrics);
 

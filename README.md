@@ -6,7 +6,7 @@ It polls DeepSeek, OpenRouter and ProxyAPI for their remaining credit, and sampl
 
 It shows one of two things at a time, and a hotkey swaps between them:
 
-- **System** — CPU and RAM load as charts of the last minute. This is what it starts with.
+- **System** — CPU, RAM and network as charts of the last minute. This is what it starts with.
 - **Balances** — one line per provider with its remaining credit.
 
 Sampling continues in both modes, so switching back to the charts shows the minute that actually passed rather than an empty graph.
@@ -59,6 +59,7 @@ Every key is optional and falls back to the default below, so an older config fi
 | `openrouter_token` | `""` | OpenRouter API key. |
 | `proxyapi_token` | `""` | ProxyAPI key. |
 | `start_mode` | `"system"` | Mode to open in: `system` or `balances`. Anything else reads as `system`. |
+| `network_interface` | `""` | Empty picks the busiest physical adapter. Set it to part of an adapter name or description to watch that one instead. |
 | `refresh_interval_secs` | `60` | Seconds between balance polls, floored at 5. |
 | `font_name` | `"Consolas"` | Any installed font. A monospace one keeps the numbers from shifting. |
 | `font_size` | `18` | Logical pixels at 96 DPI. |
@@ -81,7 +82,11 @@ The window is sized to its own contents, so it shrinks and grows as the mode cha
 
 A provider with no token has no line in balance mode. If none of them have one, that mode says `NO TOKENS` instead of leaving a stale frame on screen.
 
-The charts hold 60 samples at one per second, newest on the right. CPU load only exists as a difference between two readings, so it shows `--` for the first second after launch; memory is absolute and appears immediately.
+The charts hold 60 samples at one per second, newest on the right. CPU and network only exist as differences between two readings, so they show `--` for the first second after launch; memory is absolute and appears immediately.
+
+The CPU and RAM charts are drawn against a fixed 0–100%. The network ones autoscale to the largest rate still in their own history, so a quiet minute is not magnified into a busy-looking one — which is why the rate beside the chart, not its height, is what tells you the actual speed.
+
+By default the network rows follow the busiest adapter that reports itself as real hardware with a physical connector. That deliberately skips VPN tunnels, hypervisor switches and TAP devices: a tunnel runs over the card it tunnels through, so counting both would report the same bytes twice.
 
 Charts are drawn opaque while the text stays translucent, which needs per-pixel alpha — the window is pushed through `UpdateLayeredWindow` rather than painted on `WM_PAINT`. Without it a translucent chart competes with whatever happens to be behind the overlay.
 

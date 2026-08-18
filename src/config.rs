@@ -11,6 +11,8 @@ pub struct Config {
     pub openrouter_token: String,
     #[serde(default = "default_start_mode")]
     pub start_mode: String,
+    #[serde(default)]
+    pub network_interface: String,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
     #[serde(default = "default_font_name")]
@@ -59,6 +61,7 @@ impl Default for Config {
             proxyapi_token: String::new(),
             openrouter_token: String::new(),
             start_mode: default_start_mode(),
+            network_interface: String::new(),
             refresh_interval_secs: default_refresh_interval(),
             font_name: default_font_name(),
             font_size: default_font_size(),
