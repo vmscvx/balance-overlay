@@ -107,7 +107,7 @@ impl Metrics {
 /// the window bitmap, and it is the only way to keep the meters opaque while
 /// the rest of the overlay stays translucent.
 pub unsafe fn present(hwnd: HWND, state: &AppState, dpi: u32) {
-    let rows = state.lines.lock().unwrap().clone();
+    let rows = state.visible_rows();
     if rows.is_empty() {
         return;
     }

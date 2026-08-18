@@ -29,7 +29,9 @@ A layered always-on-top overlay window that polls API-credit balances and paints
 
 **One pass owns geometry and drawing.** `render::present` measures, draws and hands the result to the window in a single call, so there is no separate layout step that can fall out of sync with the drawing. `render::Metrics` holds the measurements, and the width the window gets is computed from the same numbers that place the meter inside it. DPI arrives as an argument, from `GetDpiForWindow` at the call site.
 
-**`lines` has a fixed slot layout and two writers.** Slots `0..n` are the providers in `sources()` order; the last `system::LINE_COUNT` slots are the system block when `show_system` is on. The vector is allocated once at startup and *never replaced* — each writer assigns into its own slots by index, because the two run at different rates and on different threads. Sizing follows from `lines.len()`, so a failing API keeps its slot rather than collapsing the layout.
+**`lines` has a fixed slot layout and two writers.** Slots `0..provider_count` are the providers in `sources()` order; the last `system::LINE_COUNT` slots are the system block. The vector is allocated once at startup and *never replaced* — each writer assigns into its own slots by index, because the two run at different rates and on different threads. A failing API keeps its slot rather than collapsing the layout.
+
+**A mode is a window into that vector, not a different vector.** `Mode` picks which half `AppState::visible_rows` returns, and `present` sizes the window to whatever comes back. Nothing else changes with the mode: both writers keep addressing their own slots, and the `WM_TIMER` sampler runs in balance mode too, so returning to the charts shows the minute that actually passed instead of an empty graph. That is also why the sampler is not conditional on anything any more.
 
 **System metrics run on the UI thread.** `system.rs` is two Win32 calls: `GlobalMemoryStatusEx` (whose `dwMemoryLoad` is already a percentage) and `GetSystemTimes`. CPU load only exists as a *difference* between two samples, so `CpuSampler` holds the previous one plus a `HISTORY_LEN` ring of readings, and the first tick renders `--`. Both calls take microseconds and never block, which is why a `WM_TIMER` at `SYSTEM_TICK_MS` does the sampling directly in `wnd_proc` — no thread, no async, no new dependency. A per-second cadence is the point: the same number sampled by the 60-second balance poll would be meaningless, and one tick is one column of the chart.
 
@@ -53,7 +55,8 @@ A layered always-on-top overlay window that polls API-credit balances and paints
 
 ## Gotchas
 
-- The `WM_TIMER` handler overwrites the last `system::LINE_COUNT` slots, which are the system block only because the timer is started **only** when `show_system` is on. Starting it unconditionally, or letting `system::rows` return a different count than startup reserved, would silently overwrite a provider's line.
+- The `WM_TIMER` handler overwrites the last `system::LINE_COUNT` slots. If `system::rows` ever returns a different count than startup reserved, it silently overwrites a provider's line instead — the two have to move together.
+- `provider_count` is the boundary the mode filter slices on, and it is captured from `sources()` at startup. Anything that changes the number of provider rows later has to update it, or the modes show each other's rows.
 - `render::percent_text` pads to a fixed width, and `meter_row_width` measures the widest case, so the window does not twitch wider and back every second as the numbers change.
 - Every `CreateSolidBrush` and the DIB itself need their `DeleteObject`, and the pen and brush selected for `Polygon` have to be restored before the brush is deleted. `present` runs once a second forever, so a leak here is not survivable.
 - Never call `SetLayeredWindowAttributes` on this window: it and `UpdateLayeredWindow` are mutually exclusive, and whichever ran last wins. Opacity comes from `apply_alpha` now.

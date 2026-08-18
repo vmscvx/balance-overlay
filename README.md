@@ -4,6 +4,13 @@ A small always-on-top Windows overlay that keeps your API credit balances and yo
 
 It polls DeepSeek, OpenRouter and ProxyAPI for their remaining credit, and samples CPU and memory load once a second. Clicks pass straight through it, it never takes focus, and it stays out of Alt+Tab — you can leave it running over a full-screen editor and forget it is there.
 
+It shows one of two things at a time, and a hotkey swaps between them:
+
+- **System** — CPU and RAM load as charts of the last minute. This is what it starts with.
+- **Balances** — one line per provider with its remaining credit.
+
+Sampling continues in both modes, so switching back to the charts shows the minute that actually passed rather than an empty graph.
+
 ## Building
 
 ```bash
@@ -16,7 +23,7 @@ Windows only, and not by accident: it is built on Win32, GDI and `RegisterHotKey
 
 ## First run
 
-Run the executable once. It writes `balance_overlay.toml` next to itself and then hides, because with no API tokens there is nothing to show. Fill in at least one token and start it again.
+Run the executable once. It writes `balance_overlay.toml` next to itself and starts in system mode, which needs no configuration at all. To get the balance mode to show anything, add at least one token and restart.
 
 ```toml
 deepseek_token = "sk-..."
@@ -39,6 +46,7 @@ That is deliberate. The binary has no console, so the overlay itself is the only
 | Keys | Action |
 | --- | --- |
 | `Shift`+`F11` | Show / hide |
+| `Alt`+`Shift`+`F11` | Switch between system and balances |
 | `Ctrl`+`Shift`+`F11` | Quit |
 
 ## Configuration
@@ -50,8 +58,8 @@ Every key is optional and falls back to the default below, so an older config fi
 | `deepseek_token` | `""` | DeepSeek API key. Empty means the line is not shown. |
 | `openrouter_token` | `""` | OpenRouter API key. |
 | `proxyapi_token` | `""` | ProxyAPI key. |
+| `start_mode` | `"system"` | Mode to open in: `system` or `balances`. Anything else reads as `system`. |
 | `refresh_interval_secs` | `60` | Seconds between balance polls, floored at 5. |
-| `show_system` | `true` | Draw the CPU and RAM charts. |
 | `font_name` | `"Consolas"` | Any installed font. A monospace one keeps the numbers from shifting. |
 | `font_size` | `18` | Logical pixels at 96 DPI. |
 | `font_bold` | `true` | |
@@ -69,7 +77,9 @@ Tokens are stored in this file as plain text. It is listed in `.gitignore`, and 
 
 ## Notes
 
-The window is sized to its own contents, so the number of lines and the width follow from whatever is configured.
+The window is sized to its own contents, so it shrinks and grows as the mode changes and as lines come and go.
+
+A provider with no token has no line in balance mode. If none of them have one, that mode says `NO TOKENS` instead of leaving a stale frame on screen.
 
 The charts hold 60 samples at one per second, newest on the right. CPU load only exists as a difference between two readings, so it shows `--` for the first second after launch; memory is absolute and appears immediately.
 

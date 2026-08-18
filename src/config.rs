@@ -9,8 +9,8 @@ pub struct Config {
     pub proxyapi_token: String,
     #[serde(default)]
     pub openrouter_token: String,
-    #[serde(default = "default_show_system")]
-    pub show_system: bool,
+    #[serde(default = "default_start_mode")]
+    pub start_mode: String,
     #[serde(default = "default_refresh_interval")]
     pub refresh_interval_secs: u64,
     #[serde(default = "default_font_name")]
@@ -37,7 +37,7 @@ pub struct Config {
     pub pos_y: i32,
 }
 
-fn default_show_system() -> bool { true }
+fn default_start_mode() -> String { "system".into() }
 fn default_refresh_interval() -> u64 { 60 }
 fn default_font_name() -> String { "Consolas".into() }
 fn default_font_size() -> i32 { 18 }
@@ -58,7 +58,7 @@ impl Default for Config {
             deepseek_token: String::new(),
             proxyapi_token: String::new(),
             openrouter_token: String::new(),
-            show_system: default_show_system(),
+            start_mode: default_start_mode(),
             refresh_interval_secs: default_refresh_interval(),
             font_name: default_font_name(),
             font_size: default_font_size(),

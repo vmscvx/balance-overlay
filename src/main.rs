@@ -29,6 +29,30 @@ fn str_to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Which half of `lines` is on screen. The overlay shows one or the other,
+/// never both, so it stays small enough to leave running over other windows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Mode {
+    System,
+    Balances,
+}
+
+impl Mode {
+    fn toggled(self) -> Self {
+        match self {
+            Mode::System => Mode::Balances,
+            Mode::Balances => Mode::System,
+        }
+    }
+
+    fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "balances" => Mode::Balances,
+            _ => Mode::System,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub config: Mutex<config::Config>,
@@ -40,10 +64,33 @@ pub struct AppState {
     pub font: Mutex<Option<HFONT>>,
     /// UI thread only, ticked by WM_TIMER.
     pub metrics: Mutex<system::Metrics>,
+    pub mode: Mutex<Mode>,
+    /// Slots `0..provider_count` of `lines` are the providers; the rest is the
+    /// system block. Fixed at startup, which is what lets the two writers and
+    /// the mode filter address the same vector without stepping on each other.
+    pub provider_count: usize,
+}
+
+impl AppState {
+    /// The rows the current mode puts on screen.
+    pub fn visible_rows(&self) -> Vec<Row> {
+        let lines = self.lines.lock().unwrap();
+        let rows = match *self.mode.lock().unwrap() {
+            Mode::Balances => &lines[..self.provider_count],
+            Mode::System => &lines[self.provider_count..],
+        };
+        if rows.is_empty() {
+            // Balance mode with no tokens configured. Say so, rather than
+            // leaving the previous frame on screen with nothing to replace it.
+            return vec![Row::Text("NO TOKENS".into())];
+        }
+        rows.to_vec()
+    }
 }
 
 const HOTKEY_TOGGLE: u32 = 1;
 const HOTKEY_EXIT: u32 = 2;
+const HOTKEY_MODE: u32 = 3;
 const WM_UPDATE_DISPLAY: u32 = WM_USER + 1;
 const TIMER_SYSTEM: usize = 1;
 /// CPU load is a rate, so it needs a cadence of its own: the balance poll runs
@@ -106,6 +153,11 @@ unsafe extern "system" fn wnd_proc(
                 let visible = state.visible.load(Ordering::SeqCst);
                 let _ = ShowWindow(hwnd, if visible { SW_HIDE } else { SW_SHOW });
                 state.visible.store(!visible, Ordering::SeqCst);
+            } else if id == HOTKEY_MODE {
+                let mut mode = state.mode.lock().unwrap();
+                *mode = mode.toggled();
+                drop(mode);
+                render::present(hwnd, state, GetDpiForWindow(hwnd));
             } else if id == HOTKEY_EXIT {
                 let _ = DestroyWindow(hwnd);
             }
@@ -150,6 +202,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_DESTROY => {
             let _ = UnregisterHotKey(hwnd, HOTKEY_TOGGLE as i32);
+            let _ = UnregisterHotKey(hwnd, HOTKEY_MODE as i32);
             let _ = UnregisterHotKey(hwnd, HOTKEY_EXIT as i32);
 
             let mut font_lock = state.font.lock().unwrap();
@@ -316,9 +369,7 @@ fn main() {
         .iter()
         .map(|(p, _)| Row::Text(format!("{}: LOADING...", p.label())))
         .collect();
-    if cfg.show_system {
-        lines.extend(system::Metrics::default().rows());
-    }
+    lines.extend(system::Metrics::default().rows());
 
     let state = Arc::new(AppState {
         config: Mutex::new(cfg.clone()),
@@ -327,6 +378,8 @@ fn main() {
         hwnd: Mutex::new(None),
         font: Mutex::new(None),
         metrics: Mutex::new(system::Metrics::default()),
+        mode: Mutex::new(Mode::from_config(&cfg.start_mode)),
+        provider_count: srcs.len(),
     });
 
     APP_STATE.set(state.clone()).expect("APP_STATE already set");
@@ -338,20 +391,17 @@ fn main() {
     replace_font(&state, &cfg, dpi);
     unsafe { render::present(hwnd, &state, dpi) };
 
-    if cfg.show_system {
-        unsafe { SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_TICK_MS, None) };
-    }
-
-    if state.lines.lock().unwrap().is_empty() {
-        state.visible.store(false, Ordering::SeqCst);
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-    }
+    // Sampling runs in both modes: switching back to the charts should show
+    // real history, not the minute it spent hidden.
+    unsafe { SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_TICK_MS, None) };
 
     unsafe {
         if RegisterHotKey(hwnd, HOTKEY_TOGGLE as i32, MOD_SHIFT, VK_F11.0 as u32).is_err() {
             eprintln!("Warning: Failed to register Shift+F11 (maybe already in use?)");
+        }
+        if RegisterHotKey(hwnd, HOTKEY_MODE as i32, MOD_ALT | MOD_SHIFT, VK_F11.0 as u32).is_err()
+        {
+            eprintln!("Warning: Failed to register Alt+Shift+F11 (maybe already in use?)");
         }
         if RegisterHotKey(
             hwnd,
