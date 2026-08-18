@@ -76,3 +76,7 @@ The charts hold 60 samples at one per second, newest on the right. CPU load only
 Charts are drawn opaque while the text stays translucent, which needs per-pixel alpha — the window is pushed through `UpdateLayeredWindow` rather than painted on `WM_PAINT`. Without it a translucent chart competes with whatever happens to be behind the overlay.
 
 `CLAUDE.md` in the repository root goes into how the pieces fit together, and why several of them are the way they are.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
