@@ -162,9 +162,9 @@ pub unsafe fn paint(hdc: HDC, state: &AppState) {
 
                 match row {
                     Row::Graph { history, capacity, .. } => {
-                        draw_graph(mem_dc, meter, history, *capacity, meter_rgb, grid_cell)
+                        draw_graph(mem_dc, meter, history, *capacity, meter_rgb, outline_rgb, grid_cell)
                     }
-                    _ => draw_bar(mem_dc, meter, row.percent(), meter_rgb),
+                    _ => draw_bar(mem_dc, meter, row.percent(), meter_rgb, outline_rgb),
                 }
 
                 draw_row_text(
@@ -207,10 +207,13 @@ unsafe fn draw_row_text(
     DrawTextW(hdc, &mut wide, &mut rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
-/// Track, grid and fill are three steps of one color, so a single config key
-/// drives all of them and they can never clash.
-const TRACK_SHADE: u32 = 5;
-const GRID_SHADE: u32 = 7;
+/// Frame, grid and fill are three steps of the meter color, so one config key
+/// drives all of them and they can never clash. They sit on a well painted in
+/// the *outline* color: the meters need the same protection from a
+/// see-through background that the text gets from its outline, and a dark well
+/// is what keeps the desktop bleeding through from washing the chart out.
+const FRAME_SHADE: u32 = 5;
+const GRID_SHADE: u32 = 3;
 
 /// `num/16` of full intensity, per channel.
 fn shade(rgb: u32, num: u32) -> u32 {
@@ -251,20 +254,22 @@ unsafe fn draw_grid(hdc: HDC, rect: RECT, target: i32, color: u32) {
     let _ = DeleteObject(brush);
 }
 
-/// Track, then the caller's fill, then the frame on top so the fill cannot
-/// paint over its own outline.
-unsafe fn fill_and_frame(hdc: HDC, rect: RECT, fill: u32, body: impl FnOnce(HDC)) {
-    let track = CreateSolidBrush(COLORREF(shade(fill, TRACK_SHADE)));
-    let _ = FillRect(hdc, &rect, track);
+/// Well, then the caller's fill, then the frame on top so the fill cannot paint
+/// over its own edge.
+unsafe fn fill_and_frame(hdc: HDC, rect: RECT, fill: u32, well: u32, body: impl FnOnce(HDC)) {
+    let well_brush = CreateSolidBrush(COLORREF(well));
+    let _ = FillRect(hdc, &rect, well_brush);
+    let _ = DeleteObject(well_brush);
 
     body(hdc);
 
-    let _ = FrameRect(hdc, &rect, track);
-    let _ = DeleteObject(track);
+    let frame = CreateSolidBrush(COLORREF(shade(fill, FRAME_SHADE)));
+    let _ = FrameRect(hdc, &rect, frame);
+    let _ = DeleteObject(frame);
 }
 
-unsafe fn draw_bar(hdc: HDC, rect: RECT, percent: Option<u32>, fill: u32) {
-    fill_and_frame(hdc, rect, fill, |hdc| {
+unsafe fn draw_bar(hdc: HDC, rect: RECT, percent: Option<u32>, fill: u32, well: u32) {
+    fill_and_frame(hdc, rect, fill, well, |hdc| {
         let Some(percent) = percent else { return };
         let filled = (rect.right - rect.left) * percent.min(100) as i32 / 100;
         if filled <= 0 {
@@ -276,8 +281,8 @@ unsafe fn draw_bar(hdc: HDC, rect: RECT, percent: Option<u32>, fill: u32) {
     });
 }
 
-unsafe fn draw_graph(hdc: HDC, rect: RECT, history: &[u32], capacity: usize, fill: u32, grid_cell: i32) {
-    fill_and_frame(hdc, rect, fill, |hdc| {
+unsafe fn draw_graph(hdc: HDC, rect: RECT, history: &[u32], capacity: usize, fill: u32, well: u32, grid_cell: i32) {
+    fill_and_frame(hdc, rect, fill, well, |hdc| {
         // Under the chart, so the fill covers it where the load has been.
         draw_grid(hdc, rect, grid_cell, shade(fill, GRID_SHADE));
 
@@ -353,12 +358,12 @@ mod tests {
 
     #[test]
     fn shades_step_down_without_bleeding_between_channels() {
-        use super::{shade, GRID_SHADE, TRACK_SHADE};
-        assert_eq!(shade(0x000000, TRACK_SHADE), 0x000000);
-        assert_eq!(shade(0xFFFFFF, TRACK_SHADE), 0x4F4F4F);
-        assert_eq!(shade(0x0000FF, TRACK_SHADE), 0x00004F); // stays in its channel
-        // Track is darker than grid, and both are darker than the fill.
-        assert!(shade(0xFFFFFF, TRACK_SHADE) < shade(0xFFFFFF, GRID_SHADE));
-        assert!(shade(0xFFFFFF, GRID_SHADE) < 0xFFFFFF);
+        use super::{shade, FRAME_SHADE, GRID_SHADE};
+        assert_eq!(shade(0x000000, FRAME_SHADE), 0x000000);
+        assert_eq!(shade(0xFFFFFF, FRAME_SHADE), 0x4F4F4F);
+        assert_eq!(shade(0x0000FF, FRAME_SHADE), 0x00004F); // stays in its channel
+        // Grid is the faintest mark, then the frame, then the fill itself.
+        assert!(shade(0xFFFFFF, GRID_SHADE) < shade(0xFFFFFF, FRAME_SHADE));
+        assert!(shade(0xFFFFFF, FRAME_SHADE) < 0xFFFFFF);
     }
 }
