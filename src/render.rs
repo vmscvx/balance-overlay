@@ -1,16 +1,17 @@
+use std::ffi::c_void;
+
 use windows::{
     Win32::Foundation::*,
     Win32::Graphics::Gdi::*,
+    Win32::UI::WindowsAndMessaging::*,
 };
 
-use crate::{scale, AppState, GRID_CELL, METER_GAP, PAD_LEFT};
+use crate::{line_height, scale, AppState, GRID_CELL, METER_GAP, PAD_LEFT, PAD_RIGHT};
 
 /// One line of the overlay. Providers are text; the system block draws itself.
 #[derive(Debug, Clone)]
 pub enum Row {
     Text(String),
-    /// Instantaneous value, drawn as a filled progress bar.
-    Bar { label: &'static str, percent: Option<u32> },
     /// Load history, drawn as a filled area chart, newest sample on the right.
     Graph {
         label: &'static str,
@@ -23,30 +24,29 @@ pub enum Row {
 }
 
 impl Row {
-    pub fn label(&self) -> Option<&'static str> {
+    fn label(&self) -> Option<&'static str> {
         match self {
             Row::Text(_) => None,
-            Row::Bar { label, .. } | Row::Graph { label, .. } => Some(label),
-        }
-    }
-
-    fn percent(&self) -> Option<u32> {
-        match self {
-            Row::Text(_) => None,
-            Row::Bar { percent, .. } | Row::Graph { percent, .. } => *percent,
+            Row::Graph { label, .. } => Some(label),
         }
     }
 }
 
+/// Frame, grid and fill are three steps of the meter color, so one config key
+/// drives all of them and they can never clash.
+const FRAME_SHADE: u32 = 5;
+const GRID_SHADE: u32 = 3;
+const WINDOW_BG: u32 = 0x0020_2020;
+
 /// Percentages are padded to a fixed width so the column does not jitter.
-pub fn percent_text(percent: Option<u32>) -> String {
+fn percent_text(percent: Option<u32>) -> String {
     match percent {
         Some(p) => format!("{:>3}%", p),
         None => "  --".to_string(),
     }
 }
 
-pub fn text_width(hdc: HDC, text: &str) -> i32 {
+fn text_width(hdc: HDC, text: &str) -> i32 {
     let wide: Vec<u16> = text.encode_utf16().collect();
     let mut size = SIZE::default();
     unsafe {
@@ -57,80 +57,163 @@ pub fn text_width(hdc: HDC, text: &str) -> i32 {
     0
 }
 
-/// Width a meter row needs: label, meter, and the percentage column. Shared by
-/// `relayout` and `paint` so measuring and drawing cannot drift apart.
-pub fn meter_row_width(hdc: HDC, label_width: i32, meter_width: i32, dpi: u32) -> i32 {
-    let gap = scale(METER_GAP, dpi);
-    label_width + gap + meter_width + gap + text_width(hdc, &percent_text(Some(100)))
+/// Where each part of a meter row sits. Measuring and drawing cannot drift
+/// apart because the width the window needs comes from the same numbers that
+/// place the meter inside it.
+struct Metrics {
+    pad_left: i32,
+    gap: i32,
+    label_width: i32,
+    meter_width: i32,
+    percent_width: i32,
+    grid_cell: i32,
 }
 
-/// The widest label among the meter rows; both meters share it so their bars
-/// start at the same x even in a proportional font.
-pub fn label_column_width(hdc: HDC, rows: &[Row]) -> i32 {
-    rows.iter()
-        .filter_map(|r| r.label())
-        .map(|l| text_width(hdc, l))
-        .max()
-        .unwrap_or(0)
+impl Metrics {
+    fn measure(hdc: HDC, rows: &[Row], meter_width_logical: i32, dpi: u32) -> Self {
+        Self {
+            pad_left: scale(PAD_LEFT, dpi),
+            gap: scale(METER_GAP, dpi),
+            // Every meter shares the widest label, so the charts line up even
+            // in a proportional font.
+            label_width: rows
+                .iter()
+                .filter_map(|r| r.label())
+                .map(|l| text_width(hdc, l))
+                .max()
+                .unwrap_or(0),
+            meter_width: scale(meter_width_logical, dpi),
+            percent_width: text_width(hdc, &percent_text(Some(100))),
+            grid_cell: scale(GRID_CELL, dpi),
+        }
+    }
+
+    fn meter_left(&self) -> i32 {
+        self.pad_left + self.label_width + self.gap
+    }
+
+    fn row_width(&self, hdc: HDC, row: &Row) -> i32 {
+        match row {
+            Row::Text(text) => self.pad_left + text_width(hdc, text),
+            Row::Graph { .. } => {
+                self.meter_left() + self.meter_width + self.gap + self.percent_width
+            }
+        }
+    }
 }
 
-pub unsafe fn paint(hdc: HDC, state: &AppState) {
-    let font = state.font.lock().unwrap();
-    let font = font.unwrap_or_default();
-
+/// Draws the whole overlay and hands it to the window as a per-pixel-alpha
+/// surface. This replaces painting on `WM_PAINT`: `UpdateLayeredWindow` owns
+/// the window bitmap, and it is the only way to keep the meters opaque while
+/// the rest of the overlay stays translucent.
+pub unsafe fn present(hwnd: HWND, state: &AppState, dpi: u32) {
     let rows = state.lines.lock().unwrap().clone();
-
     if rows.is_empty() {
         return;
     }
 
-    let cfg = state.config.lock().unwrap();
-    let outline_width = cfg.outline_width;
+    let cfg = state.config.lock().unwrap().clone();
+    let font = state.font.lock().unwrap().unwrap_or_default();
+
+    let screen_dc = GetDC(None);
+    let mem_dc = CreateCompatibleDC(screen_dc);
+    if mem_dc.is_invalid() {
+        ReleaseDC(None, screen_dc);
+        return;
+    }
+    let old_font = SelectObject(mem_dc, font);
+
+    let m = Metrics::measure(mem_dc, &rows, cfg.meter_width, dpi);
+    let lh = line_height(&cfg, dpi);
+    let width = rows.iter().map(|r| m.row_width(mem_dc, r)).max().unwrap_or(0)
+        + scale(PAD_RIGHT, dpi)
+        + cfg.outline_width as i32 * 2;
+    let height = rows.len() as i32 * lh;
+
+    if width > 0 && height > 0 {
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width,
+                // Negative height means top-down rows, so index 0 is the top.
+                biHeight: -height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        if let Ok(bmp) = CreateDIBSection(screen_dc, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old_bmp = SelectObject(mem_dc, bmp);
+
+            let opaque = draw(mem_dc, &rows, &cfg, &m, width, height, lh);
+
+            // GDI leaves the alpha byte at zero, so it is ours to fill in.
+            // Meters get full opacity; everything else the configured value.
+            let pixels =
+                std::slice::from_raw_parts_mut(bits as *mut u32, (width * height) as usize);
+            apply_alpha(pixels, width, height, cfg.opacity, &opaque);
+
+            let position = POINT {
+                x: scale(cfg.pos_x, dpi),
+                y: scale(cfg.pos_y, dpi),
+            };
+            let size = SIZE { cx: width, cy: height };
+            let source = POINT { x: 0, y: 0 };
+            let blend = BLENDFUNCTION {
+                BlendOp: AC_SRC_OVER as u8,
+                BlendFlags: 0,
+                // Per-pixel alpha is already baked in; nothing extra on top.
+                SourceConstantAlpha: 255,
+                AlphaFormat: AC_SRC_ALPHA as u8,
+            };
+            let _ = UpdateLayeredWindow(
+                hwnd,
+                screen_dc,
+                Some(&position),
+                Some(&size),
+                mem_dc,
+                Some(&source),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            );
+
+            SelectObject(mem_dc, old_bmp);
+            let _ = DeleteObject(bmp);
+        }
+    }
+
+    SelectObject(mem_dc, old_font);
+    let _ = DeleteDC(mem_dc);
+    ReleaseDC(None, screen_dc);
+}
+
+/// Returns the rectangles that must end up fully opaque.
+unsafe fn draw(
+    hdc: HDC,
+    rows: &[Row],
+    cfg: &crate::config::Config,
+    m: &Metrics,
+    width: i32,
+    height: i32,
+    line_height: i32,
+) -> Vec<RECT> {
     let text_rgb = parse_hex_color(&cfg.text_color);
     let outline_rgb = parse_hex_color(&cfg.outline_color);
     let meter_rgb = parse_hex_color(&cfg.meter_color);
-    let meter_width_logical = cfg.meter_width;
-    let bg_rgb = 0x00202020u32;
-    drop(cfg);
 
-    let (_, _, width, height) = *state.window_rect.lock().unwrap();
+    let bg = CreateSolidBrush(COLORREF(WINDOW_BG));
+    let all = RECT { left: 0, top: 0, right: width, bottom: height };
+    let _ = FillRect(hdc, &all, bg);
+    let _ = DeleteObject(bg);
 
-    if width <= 0 || height <= 0 {
-        return;
-    }
+    SetBkMode(hdc, TRANSPARENT);
 
-    let mem_dc = CreateCompatibleDC(hdc);
-    if mem_dc.is_invalid() {
-        return;
-    }
-
-    let bmp = CreateCompatibleBitmap(hdc, width, height);
-    if bmp.is_invalid() {
-        let _ = DeleteDC(mem_dc);
-        return;
-    }
-
-    let old_bmp = SelectObject(mem_dc, bmp);
-
-    let bg_brush = CreateSolidBrush(COLORREF(bg_rgb));
-    let rect = RECT { left: 0, top: 0, right: width, bottom: height };
-    let _ = FillRect(mem_dc, &rect, bg_brush);
-    let _ = DeleteObject(bg_brush);
-
-    let old_font = SelectObject(mem_dc, font);
-    SetBkMode(mem_dc, TRANSPARENT);
-
-    // The DC reports its monitor DPI because the process is per-monitor aware;
-    // config lengths are logical and have to be scaled before use.
-    let dpi = GetDeviceCaps(mem_dc, LOGPIXELSX) as u32;
-    let pad_left = scale(PAD_LEFT, dpi);
-    let gap = scale(METER_GAP, dpi);
-    let meter_width = scale(meter_width_logical, dpi);
-    let grid_cell = scale(GRID_CELL, dpi);
-    let label_width = label_column_width(mem_dc, &rows);
-
-    let num_lines = rows.len() as i32;
-    let line_height = height / num_lines;
+    let mut opaque = Vec::new();
 
     for (i, row) in rows.iter().enumerate() {
         let y = (i as i32) * line_height;
@@ -143,48 +226,53 @@ pub unsafe fn paint(hdc: HDC, state: &AppState) {
 
         match row {
             Row::Text(text) => {
-                draw_row_text(mem_dc, text, text_rect(pad_left), text_rgb, outline_rgb, outline_width);
+                draw_row_text(hdc, text, text_rect(m.pad_left), text_rgb, outline_rgb, cfg.outline_width);
             }
-            _ => {
-                let label = row.label().unwrap_or("");
-                draw_row_text(mem_dc, label, text_rect(pad_left), text_rgb, outline_rgb, outline_width);
+            Row::Graph { label, percent, history, capacity } => {
+                draw_row_text(hdc, label, text_rect(m.pad_left), text_rgb, outline_rgb, cfg.outline_width);
 
                 // A meter reads better as a band than as a full-height block.
                 let meter_h = (line_height * 5 / 9).max(4);
-                let meter_top = y + (line_height - meter_h) / 2;
-                let meter_x = pad_left + label_width + gap;
+                let top = y + (line_height - meter_h) / 2;
                 let meter = RECT {
-                    left: meter_x,
-                    top: meter_top,
-                    right: meter_x + meter_width,
-                    bottom: meter_top + meter_h,
+                    left: m.meter_left(),
+                    top,
+                    right: m.meter_left() + m.meter_width,
+                    bottom: top + meter_h,
                 };
-
-                match row {
-                    Row::Graph { history, capacity, .. } => {
-                        draw_graph(mem_dc, meter, history, *capacity, meter_rgb, outline_rgb, grid_cell)
-                    }
-                    _ => draw_bar(mem_dc, meter, row.percent(), meter_rgb, outline_rgb),
-                }
+                draw_graph(hdc, meter, history, *capacity, meter_rgb, outline_rgb, m.grid_cell);
+                opaque.push(meter);
 
                 draw_row_text(
-                    mem_dc,
-                    &percent_text(row.percent()),
-                    text_rect(meter.right + gap),
+                    hdc,
+                    &percent_text(*percent),
+                    text_rect(meter.right + m.gap),
                     text_rgb,
                     outline_rgb,
-                    outline_width,
+                    cfg.outline_width,
                 );
             }
         }
     }
 
-    let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+    opaque
+}
 
-    SelectObject(mem_dc, old_font);
-    SelectObject(mem_dc, old_bmp);
-    let _ = DeleteObject(bmp);
-    let _ = DeleteDC(mem_dc);
+/// Bakes the alpha channel in, premultiplied, which is what `ULW_ALPHA` wants.
+fn apply_alpha(pixels: &mut [u32], width: i32, height: i32, base: u8, opaque: &[RECT]) {
+    for y in 0..height {
+        for x in 0..width {
+            let inside = opaque
+                .iter()
+                .any(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+            let a = if inside { 255u32 } else { base as u32 };
+
+            let i = (y * width + x) as usize;
+            let px = pixels[i];
+            let (b, g, r) = (px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF);
+            pixels[i] = (a << 24) | (r * a / 255) << 16 | (g * a / 255) << 8 | (b * a / 255);
+        }
+    }
 }
 
 unsafe fn draw_row_text(
@@ -206,14 +294,6 @@ unsafe fn draw_row_text(
     SetTextColor(hdc, COLORREF(text_rgb));
     DrawTextW(hdc, &mut wide, &mut rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
-
-/// Frame, grid and fill are three steps of the meter color, so one config key
-/// drives all of them and they can never clash. They sit on a well painted in
-/// the *outline* color: the meters need the same protection from a
-/// see-through background that the text gets from its outline, and a dark well
-/// is what keeps the desktop bleeding through from washing the chart out.
-const FRAME_SHADE: u32 = 5;
-const GRID_SHADE: u32 = 3;
 
 /// `num/16` of full intensity, per channel.
 fn shade(rgb: u32, num: u32) -> u32 {
@@ -254,43 +334,24 @@ unsafe fn draw_grid(hdc: HDC, rect: RECT, target: i32, color: u32) {
     let _ = DeleteObject(brush);
 }
 
-/// Well, then the caller's fill, then the frame on top so the fill cannot paint
-/// over its own edge.
-unsafe fn fill_and_frame(hdc: HDC, rect: RECT, fill: u32, well: u32, body: impl FnOnce(HDC)) {
+unsafe fn draw_graph(
+    hdc: HDC,
+    rect: RECT,
+    history: &[u32],
+    capacity: usize,
+    fill: u32,
+    well: u32,
+    grid_cell: i32,
+) {
     let well_brush = CreateSolidBrush(COLORREF(well));
     let _ = FillRect(hdc, &rect, well_brush);
     let _ = DeleteObject(well_brush);
 
-    body(hdc);
+    // Under the chart, so the fill covers it where the load has been.
+    draw_grid(hdc, rect, grid_cell, shade(fill, GRID_SHADE));
 
-    let frame = CreateSolidBrush(COLORREF(shade(fill, FRAME_SHADE)));
-    let _ = FrameRect(hdc, &rect, frame);
-    let _ = DeleteObject(frame);
-}
-
-unsafe fn draw_bar(hdc: HDC, rect: RECT, percent: Option<u32>, fill: u32, well: u32) {
-    fill_and_frame(hdc, rect, fill, well, |hdc| {
-        let Some(percent) = percent else { return };
-        let filled = (rect.right - rect.left) * percent.min(100) as i32 / 100;
-        if filled <= 0 {
-            return;
-        }
-        let brush = CreateSolidBrush(COLORREF(fill));
-        let _ = FillRect(hdc, &RECT { right: rect.left + filled, ..rect }, brush);
-        let _ = DeleteObject(brush);
-    });
-}
-
-unsafe fn draw_graph(hdc: HDC, rect: RECT, history: &[u32], capacity: usize, fill: u32, well: u32, grid_cell: i32) {
-    fill_and_frame(hdc, rect, fill, well, |hdc| {
-        // Under the chart, so the fill covers it where the load has been.
-        draw_grid(hdc, rect, grid_cell, shade(fill, GRID_SHADE));
-
-        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-        if history.len() < 2 || capacity < 2 || w <= 1 || h <= 0 {
-            return;
-        }
-
+    let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+    if history.len() >= 2 && capacity >= 2 && w > 1 && h > 0 {
         // The newest sample sits on the right edge and older ones step left by
         // a fixed slot, so a half-full history scrolls in instead of
         // stretching to fill the width.
@@ -318,7 +379,12 @@ unsafe fn draw_graph(hdc: HDC, rect: RECT, history: &[u32], capacity: usize, fil
         SelectObject(hdc, old_pen);
         SelectObject(hdc, old_brush);
         let _ = DeleteObject(brush);
-    });
+    }
+
+    // Frame last, so the fill cannot paint over its own edge.
+    let frame = CreateSolidBrush(COLORREF(shade(fill, FRAME_SHADE)));
+    let _ = FrameRect(hdc, &rect, frame);
+    let _ = DeleteObject(frame);
 }
 
 unsafe fn draw_text_outline(hdc: HDC, text: &mut [u16], rect: &RECT, width: u32) {
@@ -348,22 +414,46 @@ fn parse_hex_color(hex: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn hex_to_colorref_swaps_channels() {
-        assert_eq!(super::parse_hex_color("FF0000"), 0x0000FF); // red stays red
-        assert_eq!(super::parse_hex_color("#0000FF"), 0xFF0000);
-        assert_eq!(super::parse_hex_color("FFFFFF"), 0xFFFFFF);
-        assert_eq!(super::parse_hex_color("zzz"), 0x00FFFFFF); // garbage -> white
+        assert_eq!(parse_hex_color("FF0000"), 0x0000FF); // red stays red
+        assert_eq!(parse_hex_color("#0000FF"), 0xFF0000);
+        assert_eq!(parse_hex_color("FFFFFF"), 0xFFFFFF);
+        assert_eq!(parse_hex_color("zzz"), 0x00FFFFFF); // garbage -> white
     }
 
     #[test]
     fn shades_step_down_without_bleeding_between_channels() {
-        use super::{shade, FRAME_SHADE, GRID_SHADE};
         assert_eq!(shade(0x000000, FRAME_SHADE), 0x000000);
         assert_eq!(shade(0xFFFFFF, FRAME_SHADE), 0x4F4F4F);
         assert_eq!(shade(0x0000FF, FRAME_SHADE), 0x00004F); // stays in its channel
         // Grid is the faintest mark, then the frame, then the fill itself.
         assert!(shade(0xFFFFFF, GRID_SHADE) < shade(0xFFFFFF, FRAME_SHADE));
         assert!(shade(0xFFFFFF, FRAME_SHADE) < 0xFFFFFF);
+    }
+
+    #[test]
+    fn alpha_is_opaque_inside_the_meters_and_premultiplied_outside() {
+        let white = 0x00FF_FFFFu32;
+        let mut pixels = vec![white; 4];
+        let opaque = [RECT { left: 1, top: 0, right: 2, bottom: 1 }];
+        apply_alpha(&mut pixels, 2, 2, 128, &opaque);
+
+        // Inside the meter: fully opaque, color untouched.
+        assert_eq!(pixels[1], 0xFFFF_FFFF);
+        // Outside: alpha in the top byte, every channel scaled by it.
+        let scaled = 0xFFu32 * 128 / 255;
+        assert_eq!(pixels[0], 0x8000_0000 | scaled << 16 | scaled << 8 | scaled);
+        assert_eq!(pixels[2], pixels[0]);
+        assert_eq!(pixels[3], pixels[0]);
+    }
+
+    #[test]
+    fn black_keeps_its_alpha_with_nothing_to_scale() {
+        let mut pixels = vec![0x0000_0000u32; 1];
+        apply_alpha(&mut pixels, 1, 1, 200, &[]);
+        assert_eq!(pixels[0], 0xC800_0000);
     }
 }

@@ -38,10 +38,8 @@ pub struct AppState {
     pub visible: AtomicBool,
     pub hwnd: Mutex<Option<HWND>>,
     pub font: Mutex<Option<HFONT>>,
-    /// Physical pixels: (x, y, width, height).
-    pub window_rect: Mutex<(i32, i32, i32, i32)>,
     /// UI thread only, ticked by WM_TIMER.
-    pub cpu: Mutex<system::CpuSampler>,
+    pub metrics: Mutex<system::Metrics>,
 }
 
 const HOTKEY_TOGGLE: u32 = 1;
@@ -54,7 +52,7 @@ const SYSTEM_TICK_MS: u32 = 1000;
 
 /// Text insets inside the window, logical pixels.
 pub const PAD_LEFT: i32 = 8;
-const PAD_RIGHT: i32 = 6;
+pub const PAD_RIGHT: i32 = 6;
 /// Space on either side of a meter, between its label and its percentage.
 pub const METER_GAP: i32 = 6;
 /// Preferred chart grid cell, logical pixels. The drawing code snaps it to a
@@ -92,9 +90,10 @@ unsafe extern "system" fn wnd_proc(
 
     match msg {
         WM_PAINT => {
+            // Nothing to paint: UpdateLayeredWindow owns the window surface and
+            // keeps it across expose events. Validate the region and move on.
             let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            render::paint(hdc, state);
+            BeginPaint(hwnd, &mut ps);
             let _ = EndPaint(hwnd, &ps);
             return LRESULT(0);
         }
@@ -113,29 +112,29 @@ unsafe extern "system" fn wnd_proc(
             return LRESULT(0);
         }
         WM_UPDATE_DISPLAY => {
-            // Layout lives here, on the UI thread: SetWindowPos from the
-            // fetcher thread blocks on a synchronous message to this one.
-            relayout(hwnd, state, GetDpiForWindow(hwnd));
-            let _ = InvalidateRect(hwnd, None, FALSE);
-            let _ = UpdateWindow(hwnd);
+            // Drawing lives here, on the UI thread: the fetcher thread must not
+            // touch the window, and every window call it made would block on a
+            // synchronous message back to this one.
+            render::present(hwnd, state, GetDpiForWindow(hwnd));
             return LRESULT(0);
         }
         WM_TIMER => {
             if wparam.0 == TIMER_SYSTEM {
-                let mut cpu = state.cpu.lock().unwrap();
-                cpu.sample();
-                let texts = system::rows(&cpu, system::memory_load());
-                drop(cpu);
+                let mut metrics = state.metrics.lock().unwrap();
+                metrics.sample();
+                let rows = metrics.rows();
+                drop(metrics);
+
                 let mut lines = state.lines.lock().unwrap();
                 // The system block is the tail of the vector, in the order
                 // startup pushed it; the fetcher owns everything before it.
                 let start = lines.len().saturating_sub(system::LINE_COUNT);
-                for (slot, text) in lines[start..].iter_mut().zip(texts) {
-                    *slot = text;
+                for (slot, row) in lines[start..].iter_mut().zip(rows) {
+                    *slot = row;
                 }
                 drop(lines);
-                relayout(hwnd, state, GetDpiForWindow(hwnd));
-                let _ = InvalidateRect(hwnd, None, FALSE);
+
+                render::present(hwnd, state, GetDpiForWindow(hwnd));
             }
             return LRESULT(0);
         }
@@ -146,8 +145,7 @@ unsafe extern "system" fn wnd_proc(
             let dpi = (wparam.0 & 0xFFFF) as u32;
             let cfg = state.config.lock().unwrap().clone();
             replace_font(state, &cfg, dpi);
-            relayout(hwnd, state, dpi);
-            let _ = InvalidateRect(hwnd, None, FALSE);
+            render::present(hwnd, state, dpi);
             return LRESULT(0);
         }
         WM_DESTROY => {
@@ -212,9 +210,8 @@ fn create_window(cfg: &config::Config) -> HWND {
         panic!("CreateWindowExW failed");
     }
 
-    unsafe {
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), cfg.opacity, LWA_ALPHA);
-    }
+    // No SetLayeredWindowAttributes: it and UpdateLayeredWindow are mutually
+    // exclusive, and opacity is baked per pixel in render::present instead.
 
     hwnd
 }
@@ -224,7 +221,7 @@ pub fn scale(value: i32, dpi: u32) -> i32 {
     value * dpi as i32 / BASE_DPI
 }
 
-fn line_height(cfg: &config::Config, dpi: u32) -> i32 {
+pub fn line_height(cfg: &config::Config, dpi: u32) -> i32 {
     scale((cfg.font_size * 3 / 2).max(24), dpi)
 }
 
@@ -257,64 +254,6 @@ fn replace_font(state: &AppState, cfg: &config::Config, dpi: u32) {
         unsafe {
             let _ = DeleteObject(old);
         }
-    }
-}
-
-/// Positions the window per config and fits it to the widest line. UI thread only.
-fn relayout(hwnd: HWND, state: &AppState, dpi: u32) {
-    let rows = state.lines.lock().unwrap().clone();
-    let (lh, outline, meter_width, x, y) = {
-        let cfg = state.config.lock().unwrap();
-        (
-            line_height(&cfg, dpi),
-            cfg.outline_width as i32,
-            scale(cfg.meter_width, dpi),
-            scale(cfg.pos_x, dpi),
-            scale(cfg.pos_y, dpi),
-        )
-    };
-    let font = state.font.lock().unwrap().unwrap_or_default();
-
-    let mut content_width = 0;
-    unsafe {
-        let hdc = GetDC(hwnd);
-        let old_font = SelectObject(hdc, font);
-        let label_width = render::label_column_width(hdc, &rows);
-        for row in &rows {
-            let w = match row {
-                Row::Text(text) => render::text_width(hdc, text),
-                _ => render::meter_row_width(hdc, label_width, meter_width, dpi),
-            };
-            content_width = content_width.max(w);
-        }
-        SelectObject(hdc, old_font);
-        ReleaseDC(hwnd, hdc);
-    }
-
-    let new_rect = (
-        x,
-        y,
-        (content_width + scale(PAD_LEFT + PAD_RIGHT, dpi) + outline * 2).max(1),
-        rows.len() as i32 * lh,
-    );
-
-    let mut rect = state.window_rect.lock().unwrap();
-    if *rect == new_rect {
-        return;
-    }
-    *rect = new_rect;
-    drop(rect);
-
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            new_rect.0,
-            new_rect.1,
-            new_rect.2,
-            new_rect.3,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        );
     }
 }
 
@@ -378,7 +317,7 @@ fn main() {
         .map(|(p, _)| Row::Text(format!("{}: LOADING...", p.label())))
         .collect();
     if cfg.show_system {
-        lines.extend(system::rows(&system::CpuSampler::default(), None));
+        lines.extend(system::Metrics::default().rows());
     }
 
     let state = Arc::new(AppState {
@@ -387,8 +326,7 @@ fn main() {
         visible: AtomicBool::new(true),
         hwnd: Mutex::new(None),
         font: Mutex::new(None),
-        window_rect: Mutex::new((0, 0, 0, 0)),
-        cpu: Mutex::new(system::CpuSampler::default()),
+        metrics: Mutex::new(system::Metrics::default()),
     });
 
     APP_STATE.set(state.clone()).expect("APP_STATE already set");
@@ -398,7 +336,7 @@ fn main() {
 
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     replace_font(&state, &cfg, dpi);
-    relayout(hwnd, &state, dpi);
+    unsafe { render::present(hwnd, &state, dpi) };
 
     if cfg.show_system {
         unsafe { SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_TICK_MS, None) };
@@ -425,11 +363,6 @@ fn main() {
         {
             eprintln!("Warning: Failed to register Ctrl+Shift+F11 (maybe already in use?)");
         }
-    }
-
-    unsafe {
-        let _ = InvalidateRect(hwnd, None, FALSE);
-        let _ = UpdateWindow(hwnd);
     }
 
     thread::spawn(move || {

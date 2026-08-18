@@ -8,54 +8,74 @@ use windows::Win32::System::Threading::GetSystemTimes;
 
 use crate::render::Row;
 
-/// Samples kept for the CPU chart. One per tick, so at `SYSTEM_TICK_MS` this is
-/// also the number of seconds of history on screen.
+/// Samples kept per chart. One per tick, so at `SYSTEM_TICK_MS` this is also
+/// the number of seconds of history on screen.
 pub const HISTORY_LEN: usize = 60;
 
 /// Display slots the system block occupies. Startup reserves this many at the
 /// tail of `state.lines`, and the timer overwrites exactly those.
 pub const LINE_COUNT: usize = 2;
 
+#[derive(Debug, Default)]
+struct History(VecDeque<u32>);
+
+impl History {
+    fn push(&mut self, percent: u32) {
+        if self.0.len() == HISTORY_LEN {
+            self.0.pop_front();
+        }
+        self.0.push_back(percent.min(100));
+    }
+
+    fn latest(&self) -> Option<u32> {
+        self.0.back().copied()
+    }
+
+    /// Oldest first, so the renderer can walk it left to right.
+    fn snapshot(&self) -> Vec<u32> {
+        self.0.iter().copied().collect()
+    }
+
+    fn row(&self, label: &'static str) -> Row {
+        Row::Graph {
+            label,
+            percent: self.latest(),
+            history: self.snapshot(),
+            capacity: HISTORY_LEN,
+        }
+    }
+}
+
 fn filetime_to_u64(ft: FILETIME) -> u64 {
     (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64
 }
 
-/// The previous `GetSystemTimes` reading plus the recent load history. CPU load
-/// only exists as a difference between two readings, so the first sample has
-/// nothing to report and the chart starts empty.
+/// Both load histories, plus the previous `GetSystemTimes` reading. CPU load
+/// only exists as a difference between two readings, so its chart stays empty
+/// for one tick; memory is absolute and shows up immediately.
 #[derive(Debug, Default)]
-pub struct CpuSampler {
+pub struct Metrics {
     prev_idle: u64,
     prev_total: u64,
-    history: VecDeque<u32>,
+    cpu: History,
+    ram: History,
 }
 
-impl CpuSampler {
-    /// Takes a reading and appends it to the history. Records nothing on the
-    /// first call, or if the clock did not move between calls.
+impl Metrics {
     pub fn sample(&mut self) {
-        if let Some(percent) = self.read() {
-            self.push(percent);
+        if let Some(percent) = self.read_cpu() {
+            self.cpu.push(percent);
+        }
+        if let Some(percent) = memory_load() {
+            self.ram.push(percent);
         }
     }
 
-    fn push(&mut self, percent: u32) {
-        if self.history.len() == HISTORY_LEN {
-            self.history.pop_front();
-        }
-        self.history.push_back(percent.min(100));
+    pub fn rows(&self) -> [Row; LINE_COUNT] {
+        [self.cpu.row("CPU"), self.ram.row("RAM")]
     }
 
-    pub fn latest(&self) -> Option<u32> {
-        self.history.back().copied()
-    }
-
-    /// Oldest first, so the renderer can walk it left to right.
-    pub fn history(&self) -> Vec<u32> {
-        self.history.iter().copied().collect()
-    }
-
-    fn read(&mut self) -> Option<u32> {
+    fn read_cpu(&mut self) -> Option<u32> {
         let (mut idle, mut kernel, mut user) =
             (FILETIME::default(), FILETIME::default(), FILETIME::default());
         unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.ok()?;
@@ -83,28 +103,13 @@ fn load_percent(idle_delta: u64, total_delta: u64) -> Option<u32> {
 }
 
 /// Physical memory in use, percent.
-pub fn memory_load() -> Option<u32> {
+fn memory_load() -> Option<u32> {
     let mut status = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
         ..Default::default()
     };
     unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
     Some(status.dwMemoryLoad.min(100))
-}
-
-pub fn rows(cpu: &CpuSampler, ram: Option<u32>) -> [Row; LINE_COUNT] {
-    [
-        Row::Graph {
-            label: "CPU",
-            percent: cpu.latest(),
-            history: cpu.history(),
-            capacity: HISTORY_LEN,
-        },
-        Row::Bar {
-            label: "RAM",
-            percent: ram,
-        },
-    ]
 }
 
 #[cfg(test)]
@@ -122,16 +127,16 @@ mod tests {
 
     #[test]
     fn history_keeps_the_newest_samples_and_never_grows() {
-        let mut s = CpuSampler::default();
-        assert_eq!(s.history(), Vec::<u32>::new());
-        assert_eq!(s.latest(), None);
+        let mut h = History::default();
+        assert_eq!(h.snapshot(), Vec::<u32>::new());
+        assert_eq!(h.latest(), None);
 
         for i in 0..HISTORY_LEN as u32 * 2 {
-            s.push(i % 101);
+            h.push(i % 101);
         }
-        let kept = s.history();
+        let kept = h.snapshot();
         assert_eq!(kept.len(), HISTORY_LEN);
-        assert_eq!(s.latest(), kept.last().copied());
+        assert_eq!(h.latest(), kept.last().copied());
         // Oldest first: the window is the tail of what was pushed.
         let expected: Vec<u32> = (HISTORY_LEN as u32..HISTORY_LEN as u32 * 2)
             .map(|i| i % 101)
@@ -141,8 +146,8 @@ mod tests {
 
     #[test]
     fn samples_are_clamped_to_a_percentage() {
-        let mut s = CpuSampler::default();
-        s.push(500);
-        assert_eq!(s.latest(), Some(100));
+        let mut h = History::default();
+        h.push(500);
+        assert_eq!(h.latest(), Some(100));
     }
 }
