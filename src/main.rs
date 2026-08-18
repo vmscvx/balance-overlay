@@ -3,6 +3,7 @@
 mod balance;
 mod config;
 mod render;
+mod system;
 
 use std::sync::Arc;
 use std::sync::{
@@ -37,11 +38,17 @@ pub struct AppState {
     pub font: Mutex<Option<HFONT>>,
     /// Physical pixels: (x, y, width, height).
     pub window_rect: Mutex<(i32, i32, i32, i32)>,
+    /// UI thread only, ticked by WM_TIMER.
+    pub cpu: Mutex<system::CpuSampler>,
 }
 
 const HOTKEY_TOGGLE: u32 = 1;
 const HOTKEY_EXIT: u32 = 2;
 const WM_UPDATE_DISPLAY: u32 = WM_USER + 1;
+const TIMER_SYSTEM: usize = 1;
+/// CPU load is a rate, so it needs a cadence of its own: the balance poll runs
+/// a hundred times slower and would report a meaningless number.
+const SYSTEM_TICK_MS: u32 = 1000;
 
 /// Text inset inside the window: 8px left in render::paint, plus slack on the right.
 const PAD_X: i32 = 14;
@@ -103,6 +110,25 @@ unsafe extern "system" fn wnd_proc(
             relayout(hwnd, state, GetDpiForWindow(hwnd));
             let _ = InvalidateRect(hwnd, None, FALSE);
             let _ = UpdateWindow(hwnd);
+            return LRESULT(0);
+        }
+        WM_TIMER => {
+            if wparam.0 == TIMER_SYSTEM {
+                let cpu = state.cpu.lock().unwrap().sample();
+                let text = system::line(cpu, system::memory_load());
+                let mut lines = state.lines.lock().unwrap();
+                // The system line is the last slot; the fetcher owns the ones
+                // before it and writes them by index for the same reason.
+                if let Some(slot) = lines.last_mut() {
+                    if *slot == text {
+                        return LRESULT(0);
+                    }
+                    *slot = text;
+                }
+                drop(lines);
+                relayout(hwnd, state, GetDpiForWindow(hwnd));
+                let _ = InvalidateRect(hwnd, None, FALSE);
+            }
             return LRESULT(0);
         }
         WM_DPICHANGED => {
@@ -286,7 +312,9 @@ async fn balance_fetcher_loop(state: Arc<AppState>) {
     let client = match balance::client() {
         Ok(c) => c,
         Err(e) => {
-            *state.lines.lock().unwrap() = vec![e];
+            if let Some(slot) = state.lines.lock().unwrap().first_mut() {
+                *slot = e;
+            }
             notify(&state);
             return;
         }
@@ -302,7 +330,12 @@ async fn balance_fetcher_loop(state: Arc<AppState>) {
         for (provider, token) in &srcs {
             lines.push(balance::fetch_line(&client, *provider, token).await);
         }
-        *state.lines.lock().unwrap() = lines;
+        {
+            let mut slots = state.lines.lock().unwrap();
+            for (slot, text) in slots.iter_mut().zip(lines) {
+                *slot = text;
+            }
+        }
 
         notify(&state);
 
@@ -328,18 +361,24 @@ fn main() {
     let cfg = config::Config::load_or_create("balance_overlay.toml");
 
     let srcs = sources(&cfg);
-    let loading: Vec<String> = srcs
+    // Fixed slot layout: one per provider, then the system line if enabled.
+    // Both writers address their own slots, so neither replaces the vector.
+    let mut lines: Vec<String> = srcs
         .iter()
         .map(|(p, _)| format!("{}: LOADING...", p.label()))
         .collect();
+    if cfg.show_system {
+        lines.push(system::line(None, None));
+    }
 
     let state = Arc::new(AppState {
         config: Mutex::new(cfg.clone()),
-        lines: Mutex::new(loading),
+        lines: Mutex::new(lines),
         visible: AtomicBool::new(true),
         hwnd: Mutex::new(None),
         font: Mutex::new(None),
         window_rect: Mutex::new((0, 0, 0, 0)),
+        cpu: Mutex::new(system::CpuSampler::default()),
     });
 
     APP_STATE.set(state.clone()).expect("APP_STATE already set");
@@ -351,7 +390,11 @@ fn main() {
     replace_font(&state, &cfg, dpi);
     relayout(hwnd, &state, dpi);
 
-    if srcs.is_empty() {
+    if cfg.show_system {
+        unsafe { SetTimer(hwnd, TIMER_SYSTEM, SYSTEM_TICK_MS, None) };
+    }
+
+    if state.lines.lock().unwrap().is_empty() {
         state.visible.store(false, Ordering::SeqCst);
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
