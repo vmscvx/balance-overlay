@@ -21,6 +21,10 @@ pub struct Config {
     pub font_bold: bool,
     #[serde(default = "default_outline_width")]
     pub outline_width: u32,
+    #[serde(default = "default_meter_width")]
+    pub meter_width: i32,
+    #[serde(default = "default_meter_color")]
+    pub meter_color: String,
     #[serde(default = "default_text_color")]
     pub text_color: String,
     #[serde(default = "default_outline_color")]
@@ -39,6 +43,9 @@ fn default_font_name() -> String { "Consolas".into() }
 fn default_font_size() -> i32 { 18 }
 fn default_font_bold() -> bool { true }
 fn default_outline_width() -> u32 { 1 }
+fn default_meter_width() -> i32 { 120 }
+// Matches the text: the overlay is monochrome on a dark background.
+fn default_meter_color() -> String { "FFFFFF".into() }
 fn default_text_color() -> String { "FFFFFF".into() }
 fn default_outline_color() -> String { "000000".into() }
 fn default_opacity() -> u8 { 200 }
@@ -57,6 +64,8 @@ impl Default for Config {
             font_size: default_font_size(),
             font_bold: default_font_bold(),
             outline_width: default_outline_width(),
+            meter_width: default_meter_width(),
+            meter_color: default_meter_color(),
             text_color: default_text_color(),
             outline_color: default_outline_color(),
             opacity: default_opacity(),

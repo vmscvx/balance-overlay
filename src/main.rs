@@ -23,6 +23,7 @@ use windows::{
 };
 
 use balance::Provider;
+use render::Row;
 
 fn str_to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -31,8 +32,9 @@ fn str_to_wide(s: &str) -> Vec<u16> {
 #[derive(Debug)]
 pub struct AppState {
     pub config: Mutex<config::Config>,
-    /// One display line per configured provider, in `sources()` order.
-    pub lines: Mutex<Vec<String>>,
+    /// One display row per configured provider, in `sources()` order,
+    /// followed by the system block.
+    pub lines: Mutex<Vec<Row>>,
     pub visible: AtomicBool,
     pub hwnd: Mutex<Option<HWND>>,
     pub font: Mutex<Option<HFONT>>,
@@ -50,8 +52,14 @@ const TIMER_SYSTEM: usize = 1;
 /// a hundred times slower and would report a meaningless number.
 const SYSTEM_TICK_MS: u32 = 1000;
 
-/// Text inset inside the window: 8px left in render::paint, plus slack on the right.
-const PAD_X: i32 = 14;
+/// Text insets inside the window, logical pixels.
+pub const PAD_LEFT: i32 = 8;
+const PAD_RIGHT: i32 = 6;
+/// Space on either side of a meter, between its label and its percentage.
+pub const METER_GAP: i32 = 6;
+/// Preferred chart grid cell, logical pixels. The drawing code rounds it to a
+/// divisor of the meter height so the cells come out square.
+pub const GRID_CELL: i32 = 7;
 const MIN_REFRESH_SECS: u64 = 5;
 const BASE_DPI: i32 = 96;
 
@@ -114,15 +122,14 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_TIMER => {
             if wparam.0 == TIMER_SYSTEM {
-                let cpu = state.cpu.lock().unwrap().sample();
-                let texts = system::lines(cpu, system::memory_load());
+                let mut cpu = state.cpu.lock().unwrap();
+                cpu.sample();
+                let texts = system::rows(&cpu, system::memory_load());
+                drop(cpu);
                 let mut lines = state.lines.lock().unwrap();
                 // The system block is the tail of the vector, in the order
                 // startup pushed it; the fetcher owns everything before it.
                 let start = lines.len().saturating_sub(system::LINE_COUNT);
-                if lines[start..] == texts[..] {
-                    return LRESULT(0);
-                }
                 for (slot, text) in lines[start..].iter_mut().zip(texts) {
                     *slot = text;
                 }
@@ -213,7 +220,7 @@ fn create_window(cfg: &config::Config) -> HWND {
 }
 
 /// Config values are logical pixels at 96 DPI; everything Win32 sees is physical.
-fn scale(value: i32, dpi: u32) -> i32 {
+pub fn scale(value: i32, dpi: u32) -> i32 {
     value * dpi as i32 / BASE_DPI
 }
 
@@ -255,28 +262,30 @@ fn replace_font(state: &AppState, cfg: &config::Config, dpi: u32) {
 
 /// Positions the window per config and fits it to the widest line. UI thread only.
 fn relayout(hwnd: HWND, state: &AppState, dpi: u32) {
-    let lines = state.lines.lock().unwrap().clone();
-    let (lh, outline, x, y) = {
+    let rows = state.lines.lock().unwrap().clone();
+    let (lh, outline, meter_width, x, y) = {
         let cfg = state.config.lock().unwrap();
         (
             line_height(&cfg, dpi),
             cfg.outline_width as i32,
+            scale(cfg.meter_width, dpi),
             scale(cfg.pos_x, dpi),
             scale(cfg.pos_y, dpi),
         )
     };
     let font = state.font.lock().unwrap().unwrap_or_default();
 
-    let mut text_width = 0;
+    let mut content_width = 0;
     unsafe {
         let hdc = GetDC(hwnd);
         let old_font = SelectObject(hdc, font);
-        for line in &lines {
-            let wide: Vec<u16> = line.encode_utf16().collect();
-            let mut size = SIZE::default();
-            if GetTextExtentPoint32W(hdc, &wide, &mut size).as_bool() {
-                text_width = text_width.max(size.cx);
-            }
+        let label_width = render::label_column_width(hdc, &rows);
+        for row in &rows {
+            let w = match row {
+                Row::Text(text) => render::text_width(hdc, text),
+                _ => render::meter_row_width(hdc, label_width, meter_width, dpi),
+            };
+            content_width = content_width.max(w);
         }
         SelectObject(hdc, old_font);
         ReleaseDC(hwnd, hdc);
@@ -285,8 +294,8 @@ fn relayout(hwnd: HWND, state: &AppState, dpi: u32) {
     let new_rect = (
         x,
         y,
-        (text_width + scale(PAD_X, dpi) + outline * 2).max(1),
-        lines.len() as i32 * lh,
+        (content_width + scale(PAD_LEFT + PAD_RIGHT, dpi) + outline * 2).max(1),
+        rows.len() as i32 * lh,
     );
 
     let mut rect = state.window_rect.lock().unwrap();
@@ -314,7 +323,7 @@ async fn balance_fetcher_loop(state: Arc<AppState>) {
         Ok(c) => c,
         Err(e) => {
             if let Some(slot) = state.lines.lock().unwrap().first_mut() {
-                *slot = e;
+                *slot = Row::Text(e);
             }
             notify(&state);
             return;
@@ -327,9 +336,9 @@ async fn balance_fetcher_loop(state: Arc<AppState>) {
             (cfg.refresh_interval_secs.max(MIN_REFRESH_SECS), sources(&cfg))
         };
 
-        let mut lines = Vec::with_capacity(srcs.len());
+        let mut lines: Vec<Row> = Vec::with_capacity(srcs.len());
         for (provider, token) in &srcs {
-            lines.push(balance::fetch_line(&client, *provider, token).await);
+            lines.push(Row::Text(balance::fetch_line(&client, *provider, token).await));
         }
         {
             let mut slots = state.lines.lock().unwrap();
@@ -364,12 +373,12 @@ fn main() {
     let srcs = sources(&cfg);
     // Fixed slot layout: one per provider, then the system line if enabled.
     // Both writers address their own slots, so neither replaces the vector.
-    let mut lines: Vec<String> = srcs
+    let mut lines: Vec<Row> = srcs
         .iter()
-        .map(|(p, _)| format!("{}: LOADING...", p.label()))
+        .map(|(p, _)| Row::Text(format!("{}: LOADING...", p.label())))
         .collect();
     if cfg.show_system {
-        lines.extend(system::lines(None, None));
+        lines.extend(system::rows(&system::CpuSampler::default(), None));
     }
 
     let state = Arc::new(AppState {

@@ -1,27 +1,63 @@
 //! CPU and memory load, straight from Win32 — no crate needed for two calls.
 
+use std::collections::VecDeque;
+
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::GetSystemTimes;
 
-const BAR_CELLS: usize = 10;
+use crate::render::Row;
+
+/// Samples kept for the CPU chart. One per tick, so at `SYSTEM_TICK_MS` this is
+/// also the number of seconds of history on screen.
+pub const HISTORY_LEN: usize = 60;
+
+/// Display slots the system block occupies. Startup reserves this many at the
+/// tail of `state.lines`, and the timer overwrites exactly those.
+pub const LINE_COUNT: usize = 2;
 
 fn filetime_to_u64(ft: FILETIME) -> u64 {
     (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64
 }
 
-/// The previous `GetSystemTimes` reading. CPU load only exists as a difference
-/// between two of them, so the very first sample has nothing to report.
+/// The previous `GetSystemTimes` reading plus the recent load history. CPU load
+/// only exists as a difference between two readings, so the first sample has
+/// nothing to report and the chart starts empty.
 #[derive(Debug, Default)]
 pub struct CpuSampler {
     prev_idle: u64,
     prev_total: u64,
+    history: VecDeque<u32>,
 }
 
 impl CpuSampler {
-    /// `None` on the first call and if the clock did not move between calls.
-    pub fn sample(&mut self) -> Option<u32> {
-        let (mut idle, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
+    /// Takes a reading and appends it to the history. Records nothing on the
+    /// first call, or if the clock did not move between calls.
+    pub fn sample(&mut self) {
+        if let Some(percent) = self.read() {
+            self.push(percent);
+        }
+    }
+
+    fn push(&mut self, percent: u32) {
+        if self.history.len() == HISTORY_LEN {
+            self.history.pop_front();
+        }
+        self.history.push_back(percent.min(100));
+    }
+
+    pub fn latest(&self) -> Option<u32> {
+        self.history.back().copied()
+    }
+
+    /// Oldest first, so the renderer can walk it left to right.
+    pub fn history(&self) -> Vec<u32> {
+        self.history.iter().copied().collect()
+    }
+
+    fn read(&mut self) -> Option<u32> {
+        let (mut idle, mut kernel, mut user) =
+            (FILETIME::default(), FILETIME::default(), FILETIME::default());
         unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.ok()?;
 
         let idle = filetime_to_u64(idle);
@@ -56,34 +92,19 @@ pub fn memory_load() -> Option<u32> {
     Some(status.dwMemoryLoad.min(100))
 }
 
-fn bar(percent: Option<u32>) -> String {
-    let filled = match percent {
-        // Round to the nearest cell rather than truncating.
-        Some(p) => ((p as usize * BAR_CELLS + 50) / 100).min(BAR_CELLS),
-        None => 0,
-    };
-    "\u{2588}".repeat(filled) + &"\u{2591}".repeat(BAR_CELLS - filled)
-}
-
-/// Percentages are padded to a fixed width so the window does not twitch
-/// wider and back every second as the numbers change.
-fn percent_text(percent: Option<u32>) -> String {
-    match percent {
-        Some(p) => format!("{:>3}%", p),
-        None => "  --".to_string(),
-    }
-}
-
-/// Display slots the system block occupies. Startup reserves this many at the
-/// tail of `state.lines`, and the timer overwrites exactly those.
-pub const LINE_COUNT: usize = 2;
-
-pub fn lines(cpu: Option<u32>, ram: Option<u32>) -> [String; LINE_COUNT] {
-    [row("CPU", cpu), row("RAM", ram)]
-}
-
-fn row(label: &str, percent: Option<u32>) -> String {
-    format!("{} {} {}", label, bar(percent), percent_text(percent))
+pub fn rows(cpu: &CpuSampler, ram: Option<u32>) -> [Row; LINE_COUNT] {
+    [
+        Row::Graph {
+            label: "CPU",
+            percent: cpu.latest(),
+            history: cpu.history(),
+            capacity: HISTORY_LEN,
+        },
+        Row::Bar {
+            label: "RAM",
+            percent: ram,
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -100,25 +121,28 @@ mod tests {
     }
 
     #[test]
-    fn bar_fills_proportionally() {
-        assert_eq!(bar(Some(0)).chars().filter(|c| *c == '\u{2588}').count(), 0);
-        assert_eq!(bar(Some(100)).chars().filter(|c| *c == '\u{2588}').count(), 10);
-        assert_eq!(bar(Some(61)).chars().filter(|c| *c == '\u{2588}').count(), 6);
-        assert_eq!(bar(None).chars().count(), BAR_CELLS);
-        assert_eq!(bar(Some(55)).chars().count(), BAR_CELLS); // width never varies
+    fn history_keeps_the_newest_samples_and_never_grows() {
+        let mut s = CpuSampler::default();
+        assert_eq!(s.history(), Vec::<u32>::new());
+        assert_eq!(s.latest(), None);
+
+        for i in 0..HISTORY_LEN as u32 * 2 {
+            s.push(i % 101);
+        }
+        let kept = s.history();
+        assert_eq!(kept.len(), HISTORY_LEN);
+        assert_eq!(s.latest(), kept.last().copied());
+        // Oldest first: the window is the tail of what was pushed.
+        let expected: Vec<u32> = (HISTORY_LEN as u32..HISTORY_LEN as u32 * 2)
+            .map(|i| i % 101)
+            .collect();
+        assert_eq!(kept, expected);
     }
 
     #[test]
-    fn rows_are_equal_width_whatever_the_numbers() {
-        let widths: Vec<usize> = [Some(0), Some(5), Some(61), Some(100), None]
-            .into_iter()
-            .flat_map(|p| lines(p, p))
-            .map(|l| l.chars().count())
-            .collect();
-        assert!(
-            widths.windows(2).all(|w| w[0] == w[1]),
-            "row width must not depend on the value: {:?}",
-            widths
-        );
+    fn samples_are_clamped_to_a_percentage() {
+        let mut s = CpuSampler::default();
+        s.push(500);
+        assert_eq!(s.latest(), Some(100));
     }
 }
