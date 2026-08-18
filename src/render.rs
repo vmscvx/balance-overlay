@@ -210,7 +210,7 @@ unsafe fn draw_row_text(
 /// Track, grid and fill are three steps of one color, so a single config key
 /// drives all of them and they can never clash.
 const TRACK_SHADE: u32 = 5;
-const GRID_SHADE: u32 = 9;
+const GRID_SHADE: u32 = 7;
 
 /// `num/16` of full intensity, per channel.
 fn shade(rgb: u32, num: u32) -> u32 {
@@ -219,19 +219,19 @@ fn shade(rgb: u32, num: u32) -> u32 {
 }
 
 /// Faint reference lines under the chart, in square cells. `target` is only a
-/// wish: the real step is the nearest divisor of the meter height, so the rows
-/// come out even instead of leaving a sliver at the top, and the same step then
-/// goes across. Anchored bottom-right, on the zero line and the newest sample.
+/// wish: the cell picked is the one that divides the meter height evenly,
+/// closest to that wish, because a cell that does not divide it leaves a
+/// one-pixel sliver of a row at the top. The same cell then goes across.
+/// Anchored bottom-right, on the zero line and the newest sample.
 unsafe fn draw_grid(hdc: HDC, rect: RECT, target: i32, color: u32) {
     let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
     if target < 2 || w < 4 || h < 4 {
         return;
     }
-    let rows = ((h + target / 2) / target).max(2);
-    let cell = h / rows;
-    if cell < 2 {
+    // Exact fit first, closeness to the target second.
+    let Some(cell) = (2..=h / 2).min_by_key(|c| (h % c, (c - target).abs())) else {
         return;
-    }
+    };
 
     let brush = CreateSolidBrush(COLORREF(color));
 

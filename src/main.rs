@@ -57,9 +57,9 @@ pub const PAD_LEFT: i32 = 8;
 const PAD_RIGHT: i32 = 6;
 /// Space on either side of a meter, between its label and its percentage.
 pub const METER_GAP: i32 = 6;
-/// Preferred chart grid cell, logical pixels. The drawing code rounds it to a
-/// divisor of the meter height so the cells come out square.
-pub const GRID_CELL: i32 = 7;
+/// Preferred chart grid cell, logical pixels. The drawing code snaps it to a
+/// divisor of the meter height so the cells come out square and fit exactly.
+pub const GRID_CELL: i32 = 5;
 const MIN_REFRESH_SECS: u64 = 5;
 const BASE_DPI: i32 = 96;
 
